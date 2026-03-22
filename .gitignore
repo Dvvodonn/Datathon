@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Data (large files — download via data_download.py)
+data/raw/
+data/meta/
+data/intermediate/
+data/processed/
+
+# data_main (large/raw pipeline data)
+data_main/
+
+# NDAs (private documents)
+NDA's/
+
+# Claude memory
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+
+# Local search checkpoint (large/ephemeral state)
+models/local_search_checkpoint.json
+models/results_nodes.csv

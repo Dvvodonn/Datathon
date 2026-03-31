@@ -19,8 +19,9 @@ data/meta/
 data/intermediate/
 data/processed/
 
-# data_main (large/raw pipeline data)
-data_main/
+# data_main (large/raw pipeline data — edges_250.csv is 554 MB, share via OneDrive)
+data_main/*
+!data_main/nodes.csv
 
 # NDAs (private documents)
 NDA's/
@@ -47,3 +48,6 @@ logs/
 # Local search checkpoint (large/ephemeral state)
 models/local_search_checkpoint.json
 models/results_nodes.csv
+
+# Large raw geometries (over GitHub 100 MB limit)
+spain_interurban_edges.gpkg

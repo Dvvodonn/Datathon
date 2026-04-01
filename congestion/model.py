@@ -4,44 +4,39 @@ congestion/model.py — Extended EV charger location model with M/M/c congestion
 Extension over models/model_1.py
 ---------------------------------
 Decision variables
-  x[k]     ∈ {0,1}   station k is opened               (same as model_1)
-  y[k][c]  ∈ {0,1}   station k is opened with c chargers  (new)
+  x[k]        ∈ {0,1}   station k is opened                    (same as model_1)
+  w[k][c][p]  ∈ {0,1}   station k opened with c chargers at p kW  (replaces y)
 
 Constraints
-  Σ_c y[k][c]  ==  x[k]     for all k   (if open, choose exactly one capacity)
-  y[k][c]      ≤   x[k]     for all k,c  (capacity only if station open)
+  Σ_{c,p} w[k][c][p] == x[k]   for all k  (open station → exactly one (c,p) assignment)
 
 Objective
   Minimize:
-    Σ_{u,v} η[u,v]                            travel-time term  (same)
-  + ALPHA · Σ_{k,c} c · y[k][c]               charger build cost (ALPHA per charger)
-  + BETA  · Σ_{k,c} y[k][c] · W_q[k][c]       congestion penalty (precomputed)
+    Σ_{u,v} η[u,v]                                    travel-time term  (Benders)
+  + GAMMA · Σ_{k,c,p} w[k][c][p] · c · p              grid-connection cost (total station kW)
+  + BETA  · Σ_{k,c,p} w[k][c][p] · W[k,c,p]          total driver stop time
 
-  W_q[k][c] is the expected waiting time (minutes) at station k with c chargers,
-  computed by congestion/queuing.py before the solver runs.  The combined coefficient
-  (ALPHA·c + BETA·W_q[k][c]) is a scalar per (k,c) — the MIP stays purely linear.
+  W[k,c,p] = W_q(λ_k, μ(p), c) + 60·E_SESSION_KWH/p   [minutes]
+    ↑ queue waiting time            ↑ actual charging session time
+
+  Using W (total sojourn) instead of W_q alone ensures the model prefers higher-kW
+  chargers at busy corridors where shorter session times offset the queue wait.
+  Both terms are in minutes; all three objective components are min-equivalent.
 
 Benders subproblems
-  Unchanged from model_1.py.  The routing subproblems depend only on which stations
-  are open (x[k]), not on how many chargers are installed (y[k][c]).  The congestion
-  term lives entirely in the master problem.
+  Unchanged from model_1.py.  Routing depends only on x[k] (open/closed);
+  (c,p) decisions live entirely in the master.
 
 Warm start
-  Cuts are loaded from models/benders_cuts.json (produced by model_1.py).  These
-  cuts constrain η[u,v] as a function of x[k] and are valid regardless of the
-  cost structure.  New cuts generated here are written to
-  congestion/outputs/congestion_cuts.json and do NOT overwrite the original.
+  Cuts loaded from models/benders_cuts.json (produced by model_1.py).
+  New cuts written to congestion/outputs/congestion_cuts.json.
 
 Run
 ---
-    # single solve at default BETA
-    python congestion/model.py
-
-    # override BETA
+    python congestion/model.py                    # default gamma and beta
     python congestion/model.py --beta 2.0
-
-    # Pareto frontier sweep over BETA values
-    python congestion/model.py --frontier
+    python congestion/model.py --gamma 0.5
+    python congestion/model.py --gamma 1.0 --beta 1.0
 """
 
 import argparse
@@ -146,46 +141,61 @@ def _solve_source(src):
 
 # ── Master problem with congestion extension ──────────────────────────────────
 
-def build_master_congestion(feas_list, city_pairs, cuts, wq_lookup, alpha, beta, c_min, c_max):
+def build_master_congestion(
+    feas_list, city_pairs, cuts, w_total_lookup,
+    beta, gamma, c_min, c_max, power_tiers,
+):
     """
-    Rebuild the master MIP with the congestion extension.
+    Master MIP with w[i][j_c][j_p] ∈ {0,1} decision variables.
 
-    New decision variables: y[i][c] ∈ {0,1} for each candidate i and charger
-    count c.  x[i] is kept as an explicit variable linked to y via equality.
+    w[i][j_c][j_p] = 1  ↔  station i is open with
+                             c = c_min + j_c  chargers at
+                             p = power_tiers[j_p]  kW
 
-    Objective coefficient for y[i][c]:
-        ALPHA * c   (charger build cost)
-      + BETA * W_q[k][c]   (congestion waiting penalty, precomputed)
+    Objective coefficient for w[i][j_c][j_p]:
+        gamma * c * p                  (station grid-connection cost ∝ total kW)
+      + beta  * W[k, c, p]             (total driver stop time = W_q + session)
+
+    x[i] is kept for Benders cut compatibility:
+        x[i] == Σ_{c,p} w[i][j_c][j_p]
 
     Parameters
     ----------
-    wq_lookup : dict mapping (lon, lat, c) → wq_minutes
+    w_total_lookup : dict  (lon, lat, c, p_kw) → W_q + session_minutes
+    gamma          : float  cost per kW of total station power
+    power_tiers    : list   of kW values, e.g. [50, 100, 150, 200, 250, 350]
     """
     solver = pywraplp.Solver.CreateSolver("SCIP")
     solver.SuppressOutput()
     solver.SetTimeLimit(300_000)  # 5 min per master solve
 
-    feas_idx = {k: i for i, k in enumerate(feas_list)}
-    n        = len(feas_list)
+    feas_idx  = {k: i for i, k in enumerate(feas_list)}
+    n         = len(feas_list)
+    n_c       = c_max - c_min + 1
+    n_p       = len(power_tiers)
 
-    # x[i] ∈ {0,1}  — station open/closed (needed for cut compatibility)
+    # x[i] ∈ {0,1}  — station open/closed (Benders cuts reference x)
     x = [solver.BoolVar(f"x_{i}") for i in range(n)]
 
-    # y[i][c] ∈ {0,1}  — station i open with exactly c chargers
-    y = [[solver.BoolVar(f"y_{i}_{c}") for c in range(c_min, c_max + 1)]
+    # w[i][j_c][j_p] ∈ {0,1}
+    # j_c ∈ 0..n_c-1  (actual c = c_min + j_c)
+    # j_p ∈ 0..n_p-1  (actual p = power_tiers[j_p])
+    w = [[[solver.BoolVar(f"w_{i}_{j_c}_{j_p}")
+           for j_p in range(n_p)]
+          for j_c in range(n_c)]
          for i in range(n)]
-    # y[i] is indexed 0..c_max-c_min; actual charger count = c_min + j
 
-    # η[u,v] ≥ 0  for reachable city pairs
+    # η[u,v] ≥ 0
     eta = {(u, v): solver.NumVar(0, solver.infinity(), f"eta_{u}_{v}")
            for (u, v) in city_pairs}
 
-    # ── Linking constraints: Σ_c y[i][c] == x[i] ─────────────────────────────
+    # ── Linking: Σ_{c,p} w[i][j_c][j_p] == x[i] ──────────────────────────────
     for i in range(n):
-        ct = solver.Constraint(0, 0)          # Σ y[i][c] - x[i] == 0
+        ct = solver.Constraint(0, 0)
         ct.SetCoefficient(x[i], -1.0)
-        for yic in y[i]:
-            ct.SetCoefficient(yic, 1.0)
+        for j_c in range(n_c):
+            for j_p in range(n_p):
+                ct.SetCoefficient(w[i][j_c][j_p], 1.0)
 
     # ── Objective ─────────────────────────────────────────────────────────────
     obj = solver.Objective()
@@ -194,14 +204,15 @@ def build_master_congestion(feas_list, city_pairs, cuts, wq_lookup, alpha, beta,
 
     for i, k in enumerate(feas_list):
         klon, klat = float(k[0]), float(k[1])
-        for j, c in enumerate(range(c_min, c_max + 1)):
-            wq  = wq_lookup.get((klon, klat, c), 0.0)
-            coeff = alpha * c + beta * wq
-            obj.SetCoefficient(y[i][j], coeff)
+        for j_c, c in enumerate(range(c_min, c_max + 1)):
+            for j_p, p in enumerate(power_tiers):
+                w_total = w_total_lookup.get((klon, klat, c, p), 0.0)
+                coeff   = gamma * c * p + beta * w_total
+                obj.SetCoefficient(w[i][j_c][j_p], coeff)
 
     obj.SetMinimization()
 
-    # ── Benders cuts (identical structure to model_1.py) ─────────────────────
+    # ── Benders cuts (reference x[i], unchanged from model_1.py) ─────────────
     for cut in cuts:
         if cut["type"] == "feasibility":
             ct = solver.Constraint(1, solver.infinity())
@@ -230,75 +241,119 @@ def build_master_congestion(feas_list, city_pairs, cuts, wq_lookup, alpha, beta,
             for k in nodes:
                 ct.SetCoefficient(x[feas_idx[tuple(k)]], delta)
 
-    return solver, x, y, eta, feas_idx
+    return solver, x, w, eta, feas_idx
 
 
 # ── Upper-bound helper ────────────────────────────────────────────────────────
 
-def _compute_ub(total_t_opt, y_vals, wq_lookup, feas_list, alpha, beta, c_min, c_max):
-    """Compute upper bound from routing cost + charger costs + congestion penalty."""
-    charger_cost    = 0.0
-    congestion_cost = 0.0
+def _compute_ub(total_t_opt, w_vals, w_total_lookup,
+                feas_list, beta, gamma, c_min, c_max, power_tiers):
+    """Compute upper bound: routing cost + grid cost + total driver stop time."""
+    grid_cost   = 0.0
+    driver_cost = 0.0
     for i, k in enumerate(feas_list):
         klon, klat = float(k[0]), float(k[1])
-        for j, c in enumerate(range(c_min, c_max + 1)):
-            yval = y_vals[i][j]
-            if yval > 0.5:
-                charger_cost    += alpha * c
-                congestion_cost += beta * wq_lookup.get((klon, klat, c), 0.0)
-    return total_t_opt + charger_cost + congestion_cost
+        for j_c, c in enumerate(range(c_min, c_max + 1)):
+            for j_p, p in enumerate(power_tiers):
+                if w_vals[i][j_c][j_p] > 0.5:
+                    grid_cost   += gamma * c * p
+                    driver_cost += beta * w_total_lookup.get((klon, klat, c, p), 0.0)
+    return total_t_opt + grid_cost + driver_cost
 
 
 # ── Main Benders loop ─────────────────────────────────────────────────────────
 
 def main(
-    alpha:  float = cfg.ALPHA,
-    beta:   float = cfg.BETA,
-    mu:     float = cfg.MU_PER_CHARGER,
-    c_min:  int   = cfg.C_MIN,
-    c_max:  int   = cfg.C_MAX,
-    cuts_in_path: str = cfg.BENDERS_CUTS,
-    tag:    str   = "",
+    beta:         float = cfg.BETA,
+    gamma:        float = cfg.GAMMA,
+    c_min:        int   = cfg.C_MIN,
+    c_max:        int   = cfg.C_MAX,
+    power_tiers:  list  = None,
+    cuts_in_path: str   = cfg.BENDERS_CUTS,
+    tag:          str   = "",
 ):
     """
-    Run the congestion-extended Benders decomposition.
+    Run the congestion-extended Benders decomposition with joint (c, p) decisions.
 
-    Warm-starts from models/benders_cuts.json (cuts are independent of the
-    cost structure and remain valid for the extended objective).
+    Objective per station:
+        gamma * c * p_kW           (grid-connection cost ∝ total station power)
+      + beta  * W(λ_k, μ(p), c)   (total driver stop time = W_q + session time)
 
-    Saves results to congestion/outputs/results_congestion{tag}.csv
-    and updated cuts to congestion/outputs/congestion_cuts{tag}.json.
+    Using W instead of W_q alone drives the solver to prefer higher-kW chargers at
+    high-demand sites (shorter session times outweigh any increase in queue wait).
+
+    Existing chargers use actual (n_chargers, mean_power_kw) from DGT data — their
+    W_q is a fixed constant reported alongside the optimised cost but not in the MIP.
+
+    Saves results to congestion/outputs/results_congestion{tag}.csv.
     """
+    if power_tiers is None:
+        power_tiers = cfg.POWER_TIERS
+
     cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     n_workers = max(1, mp.cpu_count() - 1)
 
     print(f"\n{'='*65}")
-    print(f"Congestion model  |  α={alpha}  β={beta}  μ={mu}  "
-          f"c∈[{c_min},{c_max}]")
+    print(f"Congestion model  |  β={beta}  γ={gamma}  c∈[{c_min},{c_max}]  "
+          f"tiers={power_tiers} kW")
+    print(f"  Objective: γ·c·p (grid cost) + β·W(λ,μ,c) (total stop time)")
     print(f"{'='*65}")
 
-    # ── Demand and W_q ────────────────────────────────────────────────────────
+    # ── Candidate demand ──────────────────────────────────────────────────────
     demand_path = cfg.OUTPUTS_DIR / "candidate_demand.csv"
     if demand_path.exists():
-        print("Loading pre-computed demand …")
+        print("Loading pre-computed candidate demand …")
         demand_df = pd.read_csv(demand_path)
     else:
-        print("Building demand signal …")
+        print("Building candidate demand …")
         demand_df = build_demand()
 
-    wq_path = cfg.OUTPUTS_DIR / "wq_table.csv"
-    if wq_path.exists():
-        print("Loading pre-computed W_q table …")
-        wq_df = pd.read_csv(wq_path)
-    else:
-        print("Pre-computing W_q table …")
-        wq_df = precompute_wq_table(demand_df, mu=mu, c_min=c_min, c_max=c_max)
+    # ── Existing charger demand + fixed W_q ──────────────────────────────────
+    from demand import build_existing_demand
+    from queuing import compute_existing_wq
 
-    # Build (lon, lat, c) → wq_minutes lookup
-    wq_lookup = {
-        (round(row["lon"], 6), round(row["lat"], 6), int(row["c"])): float(row["wq_minutes"])
-        for _, row in wq_df.iterrows()
-    }
+    existing_path = cfg.OUTPUTS_DIR / "existing_demand.csv"
+    if existing_path.exists():
+        print("Loading pre-computed existing charger demand …")
+        existing_df = pd.read_csv(existing_path)
+    else:
+        print("Building existing charger demand …")
+        existing_df = build_existing_demand()
+
+    print("Computing fixed W_q for existing chargers …")
+    fixed_existing_wq, existing_wq_df = compute_existing_wq(existing_df)
+
+    # ── W_q table for candidates: (lon, lat, c, p_kw) → wq_minutes ───────────
+    wq_path = cfg.OUTPUTS_DIR / "wq_table.csv"
+    need_regen = True
+    if wq_path.exists():
+        wq_df = pd.read_csv(wq_path)
+        if "p_kw" in wq_df.columns:
+            existing_tiers = sorted(wq_df["p_kw"].unique().astype(int).tolist())
+            if existing_tiers == sorted(power_tiers):
+                need_regen = False
+                print("Loading pre-computed W_q table …")
+            else:
+                print(f"  W_q table tiers {existing_tiers} ≠ {sorted(power_tiers)} — regenerating")
+        else:
+            print("  W_q table missing p_kw column — regenerating")
+    if need_regen:
+        print("Pre-computing W_q table …")
+        wq_df = precompute_wq_table(demand_df, c_min=c_min, c_max=c_max,
+                                    power_tiers=power_tiers)
+
+    # Build two lookups:
+    #   wq_lookup       : (lon, lat, c, p) → W_q minutes only  (for results reporting)
+    #   w_total_lookup  : (lon, lat, c, p) → W_q + session_min  (for objective)
+    wq_lookup       = {}
+    w_total_lookup  = {}
+    for _, row in wq_df.iterrows():
+        key         = (round(row["lon"], 6), round(row["lat"], 6),
+                       int(row["c"]), int(row["p_kw"]))
+        wq          = float(row["wq_minutes"])
+        session_min = 60.0 * cfg.E_SESSION_KWH / float(row["p_kw"])
+        wq_lookup[key]      = wq
+        w_total_lookup[key] = wq + session_min
 
     # ── Load nodes and edges ──────────────────────────────────────────────────
     print("Loading nodes and edges …")
@@ -344,18 +399,24 @@ def main(
 
     upper_bound = float("inf")
     lower_bound = 0.0
-    best_x      = {k: 0 for k in feas_list}
-    best_y      = {(i, j): 0 for i in range(len(feas_list))
-                              for j in range(c_max - c_min + 1)}
+    n_c = c_max - c_min + 1
+    n_p = len(power_tiers)
+    best_x = {k: 0 for k in feas_list}
+    best_w = [[[0 for _ in range(n_p)] for _ in range(n_c)]
+              for _ in range(len(feas_list))]
 
-    print(f"\nStarting Benders loop ({cfg.MAX_ITER} max iters, {n_workers} workers) …\n")
+    n_w_vars = len(feas_list) * n_c * n_p
+    print(f"\nStarting Benders loop ({cfg.MAX_ITER} max iters, {n_workers} workers) …")
+    print(f"  Master MIP: {n_w_vars:,} w-vars + "
+          f"{len(feas_list):,} x-vars + {len(city_pairs):,} η-vars\n")
 
     for iteration in range(1, cfg.MAX_ITER + 1):
         t0 = timer.time()
 
         # ── Solve master ──────────────────────────────────────────────────────
-        solver, x, y, eta, feas_idx = build_master_congestion(
-            feas_list, city_pairs, cuts, wq_lookup, alpha, beta, c_min, c_max
+        solver, x, w, eta, feas_idx = build_master_congestion(
+            feas_list, city_pairs, cuts, w_total_lookup,
+            beta, gamma, c_min, c_max, power_tiers,
         )
         status = solver.Solve()
 
@@ -367,9 +428,11 @@ def main(
         if master_proven:
             lower_bound = solver.Objective().Value()
 
-        # Extract x and y solution values
+        # Extract solution values
         x_vals = {feas_list[i]: x[i].solution_value() for i in range(len(feas_list))}
-        y_vals = [[y[i][j].solution_value() for j in range(c_max - c_min + 1)]
+        w_vals = [[[w[i][j_c][j_p].solution_value()
+                    for j_p in range(n_p)]
+                   for j_c in range(n_c)]
                   for i in range(len(feas_list))]
         eta_vals = {(u, v): eta[(u, v)].solution_value() for (u, v) in eta}
 
@@ -452,13 +515,14 @@ def main(
                                              "nodes": [list(k) for k in feas_on_full]})
                                 cuts_added += 1
 
-        current_ub = _compute_ub(total_t_opt, y_vals, wq_lookup,
-                                  feas_list, alpha, beta, c_min, c_max)
+        current_ub = _compute_ub(total_t_opt, w_vals, w_total_lookup,
+                                  feas_list, beta, gamma, c_min, c_max, power_tiers)
 
         if current_ub < upper_bound:
             upper_bound = current_ub
             best_x = dict(x_vals)
-            best_y = [[y_vals[i][j] for j in range(c_max - c_min + 1)]
+            best_w = [[[w_vals[i][j_c][j_p] for j_p in range(n_p)]
+                       for j_c in range(n_c)]
                       for i in range(len(feas_list))]
 
         gap = (upper_bound - lower_bound) / max(upper_bound, 1e-9) * 100
@@ -480,12 +544,13 @@ def main(
     cuts_out = cfg.OUTPUTS_DIR / f"congestion_cuts{tag_str}.json"
     with open(cuts_out, "w") as f:
         json.dump({
-            "alpha": alpha, "beta": beta, "mu": mu,
-            "c_min": c_min, "c_max": c_max,
+            "beta": beta, "gamma": gamma, "c_min": c_min, "c_max": c_max,
+            "power_tiers": power_tiers,
             "feas_list":  [list(k) for k in feas_list],
             "city_pairs": [[list(u), list(v)] for u, v in city_pairs],
             "lower_bound": lower_bound,
             "upper_bound": upper_bound,
+            "fixed_existing_wq": fixed_existing_wq,
             "cuts": cuts,
         }, f)
     print(f"Cuts saved → {cuts_out}  ({len(cuts):,} cuts)")
@@ -494,23 +559,28 @@ def main(
     nodes_result = pd.read_csv(cfg.NODES_CSV)
     nodes_result["key"] = [nkey(r.lon, r.lat) for r in nodes_result.itertuples()]
 
-    # Determine built capacity for each feasible station
-    feas_set = set(feas_list)
-    c_built_map = {}
+    # Determine built (c, p) for each selected feasible station
+    feas_set     = set(feas_list)
+    c_built_map  = {}
+    p_built_map  = {}
     wq_built_map = {}
     for i, k in enumerate(feas_list):
         if best_x.get(k, 0) > 0.5:
-            for j, c in enumerate(range(c_min, c_max + 1)):
-                if best_y[i][j] > 0.5:
-                    c_built_map[k]  = c
-                    klon, klat = float(k[0]), float(k[1])
-                    wq_built_map[k] = wq_lookup.get((klon, klat, c), 0.0)
-                    break
+            klon, klat = float(k[0]), float(k[1])
+            for j_c, c in enumerate(range(c_min, c_max + 1)):
+                for j_p, p in enumerate(power_tiers):
+                    if best_w[i][j_c][j_p] > 0.5:
+                        c_built_map[k]  = c
+                        p_built_map[k]  = p
+                        wq_built_map[k] = wq_lookup.get((klon, klat, c, p), 0.0)
+                        break
 
     nodes_result["x_built"]    = nodes_result["key"].apply(
         lambda k: 1 if k in feas_set and best_x.get(k, 0) > 0.5 else 0)
     nodes_result["c_built"]    = nodes_result["key"].apply(
         lambda k: c_built_map.get(k, 0))
+    nodes_result["p_built_kw"] = nodes_result["key"].apply(
+        lambda k: p_built_map.get(k, 0))
     nodes_result["wq_minutes"] = nodes_result["key"].apply(
         lambda k: round(wq_built_map.get(k, 0.0), 4))
 
@@ -529,14 +599,30 @@ def main(
 
     # ── Summary ───────────────────────────────────────────────────────────────
     built = nodes_result[nodes_result["x_built"] == 1]
+    total_system_wq = (built["wq_minutes"].sum() + fixed_existing_wq
+                       if len(built) else fixed_existing_wq)
     print(f"\n{'='*65}")
-    print(f"Objective (UB) : {upper_bound:.2f}")
-    print(f"Lower bound    : {lower_bound:.2f}")
-    print(f"Stations built : {len(built)}")
+    print(f"Objective (UB)               : {upper_bound:.2f}")
+    print(f"Lower bound                  : {lower_bound:.2f}")
+    print(f"Stations built               : {len(built)}")
     if len(built) > 0:
-        print(f"Chargers total : {built['c_built'].sum()}")
-        print(f"Mean W_q built : {built['wq_minutes'].mean():.2f} min")
-        print(f"Charger dist   : {dict(built['c_built'].value_counts().sort_index())}")
+        print(f"Chargers total               : {int(built['c_built'].sum())}")
+        print(f"Power dist (kW)              : "
+              f"{dict(built['p_built_kw'].value_counts().sort_index())}")
+        print(f"Charger dist                 : "
+              f"{dict(built['c_built'].value_counts().sort_index())}")
+        # W_q (queue wait only) and W (total stop = W_q + session)
+        new_wq = built["wq_minutes"].sum()
+        new_w  = sum(
+            w_total_lookup.get(
+                (round(float(r["lon"]), 6), round(float(r["lat"]), 6),
+                 int(r["c_built"]), int(r["p_built_kw"])), 0.0)
+            for _, r in built.iterrows()
+        )
+        print(f"New station W_q (wait only)  : {new_wq:.1f} min")
+        print(f"New station W   (total stop) : {new_w:.1f} min")
+    print(f"Existing charger W_q (fixed) : {fixed_existing_wq:.1f} min")
+    print(f"Total system W_q             : {total_system_wq:.1f} min")
     print(f"{'='*65}\n")
 
     return nodes_result, upper_bound, lower_bound
@@ -544,83 +630,21 @@ def main(
 
 # ── Efficient frontier: sweep BETA ───────────────────────────────────────────
 
-def run_efficient_frontier(
-    beta_values: list = None,
-    alpha: float = cfg.ALPHA,
-    mu:    float = cfg.MU_PER_CHARGER,
-    c_min: int   = cfg.C_MIN,
-    c_max: int   = cfg.C_MAX,
-):
-    """
-    Sweep BETA over beta_values and record (beta, n_stations, n_chargers,
-    travel_time, wq_total, objective) for each solve.
-
-    Reuses the congestion_cuts.json from the first solve as warm start for
-    subsequent solves (same pattern as models/efficient_frontier.py reusing
-    benders_cuts.json).
-
-    Saves congestion/outputs/efficient_frontier_congestion.csv.
-    """
-    if beta_values is None:
-        beta_values = [0.0, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
-
-    cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    records = []
-
-    first_cuts = cfg.BENDERS_CUTS   # initial warm start from base model
-
-    for beta in beta_values:
-        print(f"\n--- β = {beta} ---")
-        tag = f"beta{str(beta).replace('.', 'p')}"
-        result_df, ub, lb = main(
-            alpha=alpha, beta=beta, mu=mu,
-            c_min=c_min, c_max=c_max,
-            cuts_in_path=first_cuts, tag=tag,
-        )
-        # Use this solve's cuts as warm start for next β
-        new_cuts = cfg.OUTPUTS_DIR / f"congestion_cuts_{tag}.json"
-        if new_cuts.exists():
-            first_cuts = str(new_cuts)
-
-        built = result_df[result_df["x_built"] == 1]
-        records.append({
-            "beta":        beta,
-            "n_stations":  len(built),
-            "n_chargers":  int(built["c_built"].sum()),
-            "wq_total":    round(built["wq_minutes"].sum(), 2),
-            "objective":   round(ub, 2),
-            "lower_bound": round(lb, 2),
-        })
-
-    frontier = pd.DataFrame(records)
-    out = cfg.OUTPUTS_DIR / "efficient_frontier_congestion.csv"
-    frontier.to_csv(out, index=False)
-    print(f"\nFrontier saved → {out}")
-    print(frontier.to_string(index=False))
-    return frontier
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Congestion-extended EV charger location model"
     )
-    parser.add_argument("--beta",     type=float, default=None,
-                        help="Congestion weight β (overrides config.BETA)")
-    parser.add_argument("--alpha",    type=float, default=cfg.ALPHA,
-                        help="Cost per charger α (minutes)")
-    parser.add_argument("--mu",       type=float, default=cfg.MU_PER_CHARGER,
-                        help="Service rate μ (vehicles/hour/charger)")
-    parser.add_argument("--c-max",    type=int,   default=cfg.C_MAX,
-                        help="Maximum chargers per station")
-    parser.add_argument("--frontier", action="store_true",
-                        help="Sweep β values and produce Pareto frontier CSV")
+    parser.add_argument("--beta",  type=float, default=cfg.BETA,
+                        help="Driver stop-time weight β (default %(default)s)")
+    parser.add_argument("--gamma", type=float, default=cfg.GAMMA,
+                        help="Grid-connection cost per kW γ (default %(default)s)")
+    parser.add_argument("--c-max", type=int,   default=cfg.C_MAX,
+                        help="Maximum chargers per station (default %(default)s)")
+    parser.add_argument("--tag",   type=str,   default="",
+                        help="Output file suffix, e.g. 'g05' → results_congestion_g05.csv")
     args = parser.parse_args()
 
-    if args.frontier:
-        run_efficient_frontier(alpha=args.alpha, mu=args.mu, c_max=args.c_max)
-    else:
-        beta = args.beta if args.beta is not None else cfg.BETA
-        main(alpha=args.alpha, beta=beta, mu=args.mu,
-             c_min=cfg.C_MIN, c_max=args.c_max)
+    main(beta=args.beta, gamma=args.gamma, c_min=cfg.C_MIN,
+         c_max=args.c_max, tag=args.tag)

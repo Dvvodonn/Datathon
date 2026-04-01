@@ -15,10 +15,17 @@ EV_PENETRATION   = 0.05    # fraction of highway traffic assumed to be EV
                             # column named 'ev_penetration', that overrides this
 PEAK_HOUR_FACTOR = 0.10    # share of daily AADT that falls in the single
                             # busiest hour (standard value for Spanish highways)
-STOP_RATE        = 0.05    # fraction of passing EVs that actually stop at a
-                            # given station to charge (diversion/stop probability)
-                            # ~5% is a reasonable near-future highway estimate
-                            # λ_k = AADT × EV_PENETRATION × PEAK_HOUR_FACTOR × STOP_RATE
+STOP_RATE        = 0.05    # fraction of passing EVs that stop to charge
+
+# ── Charger power tiers (new stations only) ────────────────────────────────────
+POWER_TIERS      = [50, 100, 150, 200, 250, 350]  # kW options for new station builds
+GAMMA            = 1.0              # cost per kW of total station power (minutes-equivalent)
+                                    # station grid-connection cost = GAMMA * c * p_kW
+                                    # calibrated so 1 kW ≈ 1 min-equivalent;
+                                    # sweep via --gamma flag for Pareto frontier
+E_SESSION_KWH    = 42.0             # average energy per charging stop (kWh)
+                                    # 60% charge on 70 kWh battery
+                                    # μ(p) = p_kW / E_SESSION_KWH  (veh/hr)
 
 # ── Spatial assignment ────────────────────────────────────────────────────────
 TIER1_MAX_KM     = 10.0    # use actual IMD measurement if nearest segment
@@ -52,9 +59,10 @@ MAX_ITER         = 50      # Benders iteration cap
 CONV_TOL         = 1e-2    # stop when (UB − LB) / UB < 0.01 %
 
 # ── File paths (relative to project root) ─────────────────────────────────────
-IMD_GEOJSON      = "imd_total_por_tramo.geojson"
+IMD_GEOJSON      = "data_main/traffic/imd_total_por_tramo.geojson"
 ANNUAL_FLOW_GPKG = "annual_flow_2024.gpkg"   # 847 detector points; future use
-EDGES_GPKG       = "spain_interurban_edges.gpkg"
+EDGES_GPKG       = "data/raw/road_network/spain_interurban_edges.gpkg"
+ROAD_FLOW_CSV    = "data_main/road_edges_flow.csv"  # calibrated AADT for all OSM edges
 NODES_CSV        = "data_main/nodes.csv"
 EDGES_250_CSV    = "data_main/edges_250.csv"
 BENDERS_CUTS     = "models/benders_cuts.json"

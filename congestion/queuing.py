@@ -128,63 +128,109 @@ def wq_minutes(
 
 def precompute_wq_table(
     demand_df: pd.DataFrame,
-    mu:    float = cfg.MU_PER_CHARGER,
-    c_min: int   = cfg.C_MIN,
-    c_max: int   = cfg.C_MAX,
+    c_min: int = cfg.C_MIN,
+    c_max: int = cfg.C_MAX,
+    power_tiers: list = None,
+    e_session_kwh: float = cfg.E_SESSION_KWH,
 ) -> pd.DataFrame:
     """
-    For every candidate station k and every charger count c ∈ [c_min, c_max],
-    compute the expected waiting time W_q(λ_k, μ, c).
+    For every candidate station k, charger count c ∈ [c_min, c_max], and
+    power tier p ∈ power_tiers, compute W_q(λ_k, μ(p), c).
+
+    Service rate μ(p) = p_kW / e_session_kwh  (vehicles / hour / charger)
 
     Parameters
     ----------
-    demand_df : DataFrame with columns 'lat', 'lon', 'lambda_k'
-                (output of demand.build_demand)
+    demand_df     : DataFrame with columns 'lat', 'lon', 'lambda_k'
+    power_tiers   : list of kW values, default cfg.POWER_TIERS = [50, 150, 350]
 
     Returns
     -------
-    DataFrame with columns: lat, lon, c, wq_minutes
+    DataFrame with columns: lat, lon, c, p_kw, wq_minutes
     Saved to congestion/outputs/wq_table.csv.
-
-    The optimizer reads W_q[k, c] as a precomputed coefficient — the Erlang-C
-    formula never appears inside the MIP.
     """
+    if power_tiers is None:
+        power_tiers = cfg.POWER_TIERS
+
     cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
     rows = []
     for _, row in demand_df.iterrows():
         lam = float(row["lambda_k"])
         for c in range(c_min, c_max + 1):
-            wq = wq_minutes(lam, mu, c)
-            rows.append({
-                "lat":        row["lat"],
-                "lon":        row["lon"],
-                "c":          c,
-                "wq_minutes": round(wq, 6),
-            })
+            for p in power_tiers:
+                mu_p = p / e_session_kwh
+                wq   = wq_minutes(lam, mu_p, c)
+                rows.append({
+                    "lat":        row["lat"],
+                    "lon":        row["lon"],
+                    "c":          c,
+                    "p_kw":       p,
+                    "wq_minutes": round(wq, 6),
+                })
 
     wq_df = pd.DataFrame(rows)
 
-    # Diagnostic: utilisation at c=1 for all candidates
-    c1 = wq_df[wq_df["c"] == 1].copy()
-    c1 = c1.merge(demand_df[["lat", "lon", "lambda_k"]], on=["lat", "lon"], how="left")
-    rho_c1 = c1["lambda_k"] / mu
+    n_tiers = len(power_tiers)
+    n_cands = len(demand_df)
+    n_c     = c_max - c_min + 1
     print(f"  W_q table: {len(wq_df):,} rows  "
-          f"({len(demand_df):,} candidates × {c_max - c_min + 1} capacity levels)")
-    print(f"  Utilisation ρ at c=1: "
-          f"median={rho_c1.median():.4f}  "
-          f"p90={rho_c1.quantile(0.90):.4f}  "
-          f"max={rho_c1.max():.4f}")
-    unstable_c1 = (rho_c1 >= 1.0).sum()
-    if unstable_c1 > 0:
-        print(f"  WARNING: {unstable_c1} candidates have ρ ≥ 1 at c=1 "
-              f"(assigned WQ_LARGE_PENALTY={cfg.WQ_LARGE_PENALTY} min)")
+          f"({n_cands:,} candidates × {n_c} capacity levels × {n_tiers} power tiers)")
+
+    # Diagnostics per tier at c=1
+    for p in power_tiers:
+        mu_p = p / e_session_kwh
+        rho  = demand_df["lambda_k"] / mu_p
+        unstable = (rho >= 1.0).sum()
+        print(f"  {p:>3} kW  μ={mu_p:.2f}  ρ(c=1) median={rho.median():.3f}  "
+              f"p90={rho.quantile(0.9):.3f}  unstable={unstable}")
 
     out_path = cfg.OUTPUTS_DIR / "wq_table.csv"
     wq_df.to_csv(out_path, index=False)
     print(f"  Saved → {out_path}")
-
     return wq_df
+
+
+def compute_existing_wq(
+    existing_df: pd.DataFrame,
+    e_session_kwh: float = cfg.E_SESSION_KWH,
+) -> tuple:
+    """
+    Compute W_q for each existing charger station at its actual (n_chargers, power).
+
+    Parameters
+    ----------
+    existing_df : DataFrame from build_existing_demand() with columns
+                  lat, lon, lambda_k, n_chargers, mean_power_kw
+
+    Returns
+    -------
+    (total_wq, per_station_df)
+      total_wq       — sum of W_q across all existing stations (minutes)
+      per_station_df — existing_df with added wq_minutes and mu_k columns
+    """
+    result = existing_df.copy()
+    wq_list = []
+    mu_list  = []
+
+    for _, row in existing_df.iterrows():
+        lam  = float(row["lambda_k"])
+        c_k  = max(1, int(row["n_chargers"]))
+        p_k  = float(row["mean_power_kw"])
+        mu_k = p_k / e_session_kwh if p_k > 0 else 22.0 / e_session_kwh
+        wq   = wq_minutes(lam, mu_k, c_k)
+        wq_list.append(round(wq, 4))
+        mu_list.append(round(mu_k, 4))
+
+    result["mu_k"]       = mu_list
+    result["wq_minutes"] = wq_list
+    total_wq = result["wq_minutes"].sum()
+
+    saturated = (result["wq_minutes"] >= cfg.WQ_LARGE_PENALTY).sum()
+    print(f"  Existing charger W_q: total={total_wq:,.1f} min  "
+          f"mean={result['wq_minutes'].mean():.1f}  "
+          f"saturated={saturated}")
+    return total_wq, result
 
 
 # ── Standalone entry point ────────────────────────────────────────────────────

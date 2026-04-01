@@ -3,19 +3,14 @@ congestion/demand.py — Road traffic → EV charging demand signal per candidat
 
 Pipeline
 --------
-1. load_imd()              load and reproject the IMD GeoJSON (AADT by road segment)
-2. build_class_means()     compute length-weighted mean AADT per IMD road type,
-                           then map to OSM highway classes — avoids the cross-class
-                           spatial-join contamination identified during data analysis
-3. load_edge_centroids()   load OSM edge centroids for Tier-2 highway-class lookup
-4. assign_aadt()           three-tier AADT assignment for each candidate station:
-                             Tier 1 — actual measurement   (nearest IMD ≤ TIER1_MAX_KM)
-                             Tier 2 — class-mean imputation (TIER1 < dist ≤ TIER2_MAX_KM)
-                             Tier 3 — class-mean, higher uncertainty (dist > TIER2_MAX_KM)
-5. add_usage_crosscheck()  append usage_count from Benders cuts as a quality signal
-6. compute_lambda()        convert AADT → λ_k (EV vehicles/hour) via EV penetration
+1. assign_aadt_from_flow() assign AADT to each candidate from data_main/road_edges_flow.csv
+                           (calibrated three-tier AADT for all 326,183 OSM edges).
+                           Finds nearest OSM edge midpoint via cKDTree and reads its
+                           effective_aadt and aadt_source directly.
+2. add_usage_crosscheck()  append usage_count from Benders cuts as a quality signal
+3. compute_lambda()        convert AADT → λ_k (EV vehicles/hour) via EV penetration
                            and peak-hour factor; respects per-segment override column
-7. build_demand()          top-level entry point; saves outputs/candidate_demand.csv
+4. build_demand()          top-level entry point; saves outputs/candidate_demand.csv
 
 Run standalone
 --------------
@@ -42,7 +37,82 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 
 
-# ── 1. Load IMD GeoJSON ───────────────────────────────────────────────────────
+# ── AADT assignment from road_edges_flow.csv ─────────────────────────────────
+
+def assign_aadt_from_flow(
+    candidates_gdf: gpd.GeoDataFrame,
+    flow_csv:   str = cfg.ROAD_FLOW_CSV,
+    edges_gpkg: str = cfg.EDGES_GPKG,
+) -> gpd.GeoDataFrame:
+    """
+    Assign AADT to every candidate station using data_main/road_edges_flow.csv
+    (calibrated three-tier AADT for all 326,183 OSM edges).
+
+    Finds the nearest OSM edge midpoint to each candidate via cKDTree and reads
+    its effective_aadt and aadt_source directly.  No IMD spatial join needed.
+
+    Returns candidates_gdf extended with:
+      aadt_assigned  — effective_aadt of the nearest OSM edge (veh/day)
+      impute_tier    — 1/2/3 mapped from aadt_source
+      edge_dist_m    — distance to nearest OSM edge midpoint (metres)
+    """
+    from scipy.spatial import cKDTree
+
+    print("  Loading road_edges_flow.csv …")
+    flow = pd.read_csv(flow_csv, usecols=["effective_aadt", "aadt_source", "highway"])
+
+    print("  Loading OSM edge geometries for midpoints …")
+    edges = gpd.read_file(edges_gpkg, columns=["geometry"])
+    edges = edges.to_crs("EPSG:25830")
+    midpoints = edges.geometry.interpolate(0.5, normalized=True)
+
+    mid_x = midpoints.x.values
+    mid_y = midpoints.y.values
+    valid  = np.isfinite(mid_x) & np.isfinite(mid_y)
+    mid_x, mid_y    = mid_x[valid], mid_y[valid]
+    flow_valid      = flow[valid].reset_index(drop=True)
+
+    print(f"  Building KD-tree from {len(mid_x):,} edge midpoints …")
+    tree = cKDTree(np.column_stack([mid_x, mid_y]))
+
+    cand_x = candidates_gdf.geometry.x.values
+    cand_y = candidates_gdf.geometry.y.values
+    dists, idxs = tree.query(np.column_stack([cand_x, cand_y]), k=1)
+
+    result = candidates_gdf.copy()
+    result["aadt_assigned"]  = flow_valid["effective_aadt"].values[idxs]
+    result["edge_dist_m"]    = dists
+    # highway_clean: first token only (handles "motorway|motorway_link" tags)
+    result["highway_class"]  = (
+        pd.Series(flow_valid["highway"].values[idxs])
+        .str.split("|").str[0]
+        .fillna("secondary")
+        .values
+    )
+
+    tier_map = {
+        "tier1_name_spatial": 1,
+        "tier2_road_idw":     2,
+        "tier3_knn":          3,
+    }
+    result["impute_tier"] = (
+        pd.Series(flow_valid["aadt_source"].values[idxs]).map(tier_map).fillna(3).values
+    )
+
+    tier_counts = result["impute_tier"].value_counts().sort_index()
+    labels = {1: "direct MITMA (name+spatial)",
+              2: "road IDW interpolation",
+              3: "global KNN (calibrated)"}
+    print("  AADT assignment summary:")
+    for tier, count in tier_counts.items():
+        med = result.loc[result["impute_tier"] == tier, "aadt_assigned"].median()
+        print(f"    Tier {tier} ({labels[int(tier)]}): "
+              f"{count:,} candidates  median AADT={med:,.0f}")
+
+    return result
+
+
+# ── (legacy stubs kept for reference — no longer called) ─────────────────────
 
 def load_imd(path: str = cfg.IMD_GEOJSON) -> gpd.GeoDataFrame:
     """
@@ -258,7 +328,7 @@ def add_usage_crosscheck(
 
 def compute_lambda(
     result: pd.DataFrame,
-    ev_penetration:  float = cfg.EV_PENETRATION,
+    ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
     stop_rate:        float = cfg.STOP_RATE,
 ) -> pd.DataFrame:
@@ -266,21 +336,14 @@ def compute_lambda(
     Convert AADT (vehicles/day) to EV arrival rate λ_k (vehicles/hour).
 
         λ_k = AADT × ev_penetration × peak_hour_factor × stop_rate
-
-    ev_penetration  : fraction of vehicles that are EVs
-    peak_hour_factor: fraction of daily AADT in the single busiest hour
-    stop_rate       : fraction of passing EVs that actually stop to charge
-                      at this specific station (~5% is a near-future estimate)
-
-    If the DataFrame contains an 'ev_penetration' column (per-segment override),
-    that takes precedence over the global parameter for those rows.
     """
     pen = result.get("ev_penetration", pd.Series(ev_penetration, index=result.index))
     pen = pen.fillna(ev_penetration)
 
     result = result.copy()
-    result["lambda_k"] = result["aadt_assigned"] * pen * peak_hour_factor * stop_rate
-    result["lambda_k"] = result["lambda_k"].clip(lower=0.0)
+    result["stop_rate"] = stop_rate
+    result["lambda_k"]  = result["aadt_assigned"] * pen * peak_hour_factor * stop_rate
+    result["lambda_k"]  = result["lambda_k"].clip(lower=0.0)
 
     print(f"  λ_k stats (EV vehicles/hour):")
     print(f"    min={result['lambda_k'].min():.4f}  "
@@ -295,7 +358,7 @@ def compute_lambda(
 
 def build_demand(
     nodes_path:       str   = cfg.NODES_CSV,
-    imd_path:         str   = cfg.IMD_GEOJSON,
+    flow_csv:         str   = cfg.ROAD_FLOW_CSV,
     edges_path:       str   = cfg.EDGES_GPKG,
     cuts_path:        str   = cfg.BENDERS_CUTS,
     ev_penetration:   float = cfg.EV_PENETRATION,
@@ -304,8 +367,8 @@ def build_demand(
 ) -> pd.DataFrame:
     """
     Full demand pipeline. Returns a DataFrame of feasible candidate locations
-    with columns: lat, lon, name, aadt_assigned, impute_tier, imd_dist_m,
-                  usage_count, lambda_k.
+    with columns: lat, lon, name, aadt_assigned, impute_tier, edge_dist_m,
+                  highway_class, stop_rate, usage_count, lambda_k.
 
     Also writes congestion/outputs/candidate_demand.csv.
     """
@@ -324,16 +387,11 @@ def build_demand(
         crs="EPSG:4326",
     ).to_crs("EPSG:25830")
 
-    # Load IMD and compute class means
-    imd_gdf     = load_imd(imd_path)
-    class_means = build_class_means(imd_gdf)
-    edge_cents  = load_edge_centroids(edges_path)
+    # AADT assignment from road_edges_flow.csv (also sets highway_class)
+    assigned = assign_aadt_from_flow(candidates_gdf, flow_csv, edges_path)
 
-    # Three-tier AADT assignment
-    assigned = assign_aadt(candidates_gdf, imd_gdf, edge_cents, class_means)
-
-    # Drop GeoDataFrame back to plain DataFrame for downstream use
-    result = pd.DataFrame(assigned.drop(columns=["geometry", "aadt_direct"]))
+    # Drop GeoDataFrame back to plain DataFrame
+    result = pd.DataFrame(assigned.drop(columns=["geometry"]))
 
     # Attach Benders usage-count cross-check
     result = add_usage_crosscheck(result, cuts_path)
@@ -344,7 +402,8 @@ def build_demand(
     # Keep a clean ordered column set
     keep_cols = [
         "lat", "lon", "name",
-        "aadt_assigned", "impute_tier", "imd_dist_m",
+        "aadt_assigned", "impute_tier", "edge_dist_m",
+        "highway_class", "stop_rate",
         "usage_count", "lambda_k",
     ]
     result = result[[c for c in keep_cols if c in result.columns]]
@@ -356,9 +415,72 @@ def build_demand(
     return result
 
 
+# ── 8. Existing charger demand (fixed capacity, actual power) ─────────────────
+
+def build_existing_demand(
+    nodes_path:       str   = cfg.NODES_CSV,
+    flow_csv:         str   = cfg.ROAD_FLOW_CSV,
+    edges_path:       str   = cfg.EDGES_GPKG,
+    ev_penetration:   float = cfg.EV_PENETRATION,
+    peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
+    stop_rate:        float = cfg.STOP_RATE,
+) -> pd.DataFrame:
+    """
+    Compute λ_k for every existing charger station, paired with its actual
+    n_chargers and mean_power_kw from the enriched nodes.csv.
+
+    Returns a DataFrame with columns:
+      lat, lon, n_chargers, mean_power_kw, aadt_assigned, lambda_k
+
+    Also writes congestion/outputs/existing_demand.csv.
+    """
+    cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("=== Existing charger demand ===")
+    nodes = pd.read_csv(nodes_path)
+
+    if "n_chargers" not in nodes.columns:
+        raise RuntimeError(
+            "nodes.csv missing 'n_chargers' — run "
+            "scripts/processing/enrich_nodes_capacity.py first"
+        )
+
+    existing = nodes[nodes["is_existing_charger"] == 1].copy().reset_index(drop=True)
+    print(f"  Existing charger stations: {len(existing):,}")
+
+    existing_gdf = gpd.GeoDataFrame(
+        existing,
+        geometry=gpd.points_from_xy(existing["lon"], existing["lat"]),
+        crs="EPSG:4326",
+    ).to_crs("EPSG:25830")
+
+    assigned = assign_aadt_from_flow(existing_gdf, flow_csv, edges_path)
+    result = pd.DataFrame(assigned.drop(columns=["geometry"]))
+
+    result["stop_rate"] = stop_rate
+    pen = ev_penetration
+    result["lambda_k"] = (
+        result["aadt_assigned"] * pen * peak_hour_factor * stop_rate
+    ).clip(lower=0.0)
+
+    keep = ["lat", "lon", "n_chargers", "mean_power_kw",
+            "aadt_assigned", "highway_class", "lambda_k"]
+    result = result[[c for c in keep if c in result.columns]]
+
+    out = cfg.OUTPUTS_DIR / "existing_demand.csv"
+    result.to_csv(out, index=False)
+    print(f"  Saved → {out}  ({len(result):,} rows)")
+    print(f"  λ_k: min={result['lambda_k'].min():.4f}  "
+          f"median={result['lambda_k'].median():.4f}  "
+          f"max={result['lambda_k'].max():.4f}")
+    return result
+
+
 # ── Standalone entry point ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     demand = build_demand()
+    existing = build_existing_demand()
     print("\nDone.")
-    print(demand.head(10).to_string())
+    print(demand.head(5).to_string())
+    print(existing.head(5).to_string())

@@ -3,12 +3,16 @@ visualizations/plot_comparison_sr.py
 ======================================
 Side-by-side comparison of fixed vs variable stop rate solutions.
 
-Left  : Fixed stop rate (5% flat)    — results_congestion.csv
-Right : Variable stop rate (corridor-aware logistic) — results_congestion_variable_sr.csv
+Left  : Fixed stop rate (5% flat)    — results_congestion[_<tag>].csv
+Right : Variable stop rate (corridor-aware logistic) — results_congestion_variable_sr[_<tag>].csv
 
 Both panels: black background, roads coloured by AADT, green station dots.
+
+Usage:
+  python visualizations/plot_comparison_sr.py [--tag v2]
 """
 
+import argparse
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as mcm
@@ -18,11 +22,17 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 
-RESULTS_FIXED    = "congestion/outputs/results_congestion.csv"
-RESULTS_VARIABLE = "congestion/outputs/results_congestion_variable_sr.csv"
+parser = argparse.ArgumentParser()
+parser.add_argument("--tag", type=str, default="",
+                    help="Result file tag, e.g. 'v2'")
+args = parser.parse_args()
+
+tag_str          = f"_{args.tag}" if args.tag else ""
+RESULTS_FIXED    = f"congestion/outputs/results_congestion{tag_str}.csv"
+RESULTS_VARIABLE = f"congestion/outputs/results_congestion_variable_sr{tag_str}.csv"
 NODES_PATH       = "data_main/nodes.csv"
 ROADS_GPKG       = "data/raw/road_network/spain_interurban_edges.gpkg"
-OUT_PNG          = "visualizations/solution_map_comparison_sr.png"
+OUT_PNG          = f"visualizations/solution_map_comparison_sr{tag_str}.png"
 
 XLIM = (-9.5, 4.5)
 YLIM = (35.8, 44.0)

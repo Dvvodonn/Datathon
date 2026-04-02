@@ -457,23 +457,25 @@ def build_demand(
     cuts_path:        str   = cfg.BENDERS_CUTS,
     ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
+    variable_sr:      bool  = True,
 ) -> pd.DataFrame:
     """
-    Full demand pipeline with corridor-aware variable stop rates.
+    Full demand pipeline.
 
-    Stop rate per candidate is a logistic function of the through-gap to the
-    nearest existing charger along the road corridor (edges_250.csv distances).
-    This replaces the flat STOP_RATE constant.
+    variable_sr=True  : stop rate is a logistic function of through-gap to
+                        nearest existing charger (corridor-aware).
+    variable_sr=False : flat STOP_RATE constant for every candidate.
 
     Returns a DataFrame with columns:
       lat, lon, name, aadt_assigned, impute_tier, edge_dist_m,
-      highway_class, through_gap_km, stop_rate, usage_count, lambda_k
+      highway_class, [through_gap_km, stop_rate,] usage_count, lambda_k
 
     Writes congestion/outputs/candidate_demand.csv.
     """
     cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=== Demand pipeline (variable stop rate) ===")
+    mode = "variable stop rate" if variable_sr else f"flat stop rate ({cfg.STOP_RATE})"
+    print(f"=== Demand pipeline ({mode}) ===")
 
     nodes = pd.read_csv(nodes_path)
     candidates = nodes[nodes["is_feasible_location"] == 1].copy().reset_index(drop=True)
@@ -489,11 +491,13 @@ def build_demand(
     result = pd.DataFrame(assigned.drop(columns=["geometry"]))
     result = add_usage_crosscheck(result, cuts_path)
 
-    # Corridor-aware through-gap → variable stop rate
-    through_gap   = compute_corridor_gaps(result, edges_250_path)
-    stop_rates    = compute_variable_stop_rates(through_gap)
-    result["through_gap_km"] = through_gap.values
-    result = compute_lambda(result, ev_penetration, peak_hour_factor, stop_rates.values)
+    if variable_sr:
+        through_gap = compute_corridor_gaps(result, edges_250_path)
+        stop_rates  = compute_variable_stop_rates(through_gap)
+        result["through_gap_km"] = through_gap.values
+        result = compute_lambda(result, ev_penetration, peak_hour_factor, stop_rates.values)
+    else:
+        result = compute_lambda(result, ev_penetration, peak_hour_factor, cfg.STOP_RATE)
 
     keep_cols = [
         "lat", "lon", "name",

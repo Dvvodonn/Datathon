@@ -13,8 +13,9 @@ from pathlib import Path
 EV_PENETRATION   = 0.05    # fraction of highway traffic assumed to be EV
                             # if the input AADT data contains a per-segment
                             # column named 'ev_penetration', that overrides this
-PEAK_HOUR_FACTOR = 0.10    # share of daily AADT that falls in the single
-                            # busiest hour (standard value for Spanish highways)
+PEAK_HOUR_FACTOR = 0.13    # share of daily AADT that falls in the single
+                            # busiest hour; 0.13 ≈ busy-weekend design standard
+                            # for Spanish interurban highways (was 0.10)
 STOP_RATE        = 0.05    # flat stop rate — used only for existing charger demand
 
 # ── Variable stop rate (corridor-aware, logistic of through-gap) ───────────────

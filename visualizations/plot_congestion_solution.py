@@ -10,9 +10,13 @@ Map of the congestion-extended Benders solution.
   Dot size     : proportional to λ_k (arrival rate)
   Halo ring    : W_q waiting time (radius ∝ log W_q)
 
-Output: visualizations/congestion_solution.png
+Usage:
+  python visualizations/plot_congestion_solution.py [--tag v2]
+
+Output: visualizations/congestion_solution[_<tag>].png
 """
 
+import argparse
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
@@ -20,10 +24,16 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 
-RESULTS_PATH = "congestion/outputs/results_congestion.csv"
+parser = argparse.ArgumentParser()
+parser.add_argument("--tag", type=str, default="",
+                    help="Result file tag, e.g. 'v2' reads results_congestion_v2.csv")
+args = parser.parse_args()
+
+tag_str      = f"_{args.tag}" if args.tag else ""
+RESULTS_PATH = f"congestion/outputs/results_congestion{tag_str}.csv"
 NODES_PATH   = "data_main/nodes.csv"
 ROADS_GPKG   = "data/raw/road_network/spain_interurban_edges.gpkg"
-OUT_PNG      = "visualizations/congestion_solution.png"
+OUT_PNG      = f"visualizations/congestion_solution{tag_str}.png"
 
 XLIM = (-9.5, 4.5)
 YLIM = (35.8, 44.0)

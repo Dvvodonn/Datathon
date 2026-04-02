@@ -42,6 +42,7 @@ Run
 import argparse
 import heapq
 import json
+import math
 import multiprocessing as mp
 import sys
 import time as timer
@@ -143,7 +144,7 @@ def _solve_source(src):
 
 def build_master_congestion(
     feas_list, city_pairs, cuts, w_total_lookup,
-    beta, gamma, c_min, c_max, power_tiers,
+    beta, gamma, c_min, c_max, power_tiers, lambda_lookup,
 ):
     """
     Master MIP with w[i][j_c][j_p] ∈ {0,1} decision variables.
@@ -159,9 +160,14 @@ def build_master_congestion(
     x[i] is kept for Benders cut compatibility:
         x[i] == Σ_{c,p} w[i][j_c][j_p]
 
+    Stability constraint: w[i][j_c][j_p] = 0 for any (k, c, p) where
+        c · μ(p) ≤ λ_k  (ρ ≥ 1 — queue is unstable).
+    If no feasible (c, p) exists for a location, x[i] is forced to 0.
+
     Parameters
     ----------
     w_total_lookup : dict  (lon, lat, c, p_kw) → W_q + session_minutes
+    lambda_lookup  : dict  (lon, lat) → λ_k  (EV arrivals / hour)
     gamma          : float  cost per kW of total station power
     power_tiers    : list   of kW values, e.g. [50, 100, 150, 200, 250, 350]
     """
@@ -188,6 +194,23 @@ def build_master_congestion(
     # η[u,v] ≥ 0
     eta = {(u, v): solver.NumVar(0, solver.infinity(), f"eta_{u}_{v}")
            for (u, v) in city_pairs}
+
+    # ── Stability: fix w[i][j_c][j_p] = 0 whenever ρ = λ/(c·μ) ≥ 1 ──────────
+    # This prevents the solver from placing a station it cannot actually serve.
+    # If all (c, p) combinations are infeasible for location i, x[i] is forced
+    # to 0 by the linking constraint below.
+    n_fixed = 0
+    for i, k in enumerate(feas_list):
+        klon, klat = float(k[0]), float(k[1])
+        lam_k = lambda_lookup.get((klon, klat), 0.0)
+        for j_p, p in enumerate(power_tiers):
+            mu_p = p / cfg.E_SESSION_KWH
+            for j_c, c in enumerate(range(c_min, c_max + 1)):
+                if c * mu_p <= lam_k:   # ρ ≥ 1 — unstable
+                    w[i][j_c][j_p].SetUb(0.0)
+                    n_fixed += 1
+    if n_fixed:
+        print(f"  Stability: fixed {n_fixed:,} w-vars to 0 (ρ ≥ 1)")
 
     # ── Linking: Σ_{c,p} w[i][j_c][j_p] == x[i] ──────────────────────────────
     for i in range(n):
@@ -271,6 +294,7 @@ def main(
     power_tiers:  list  = None,
     cuts_in_path: str   = cfg.BENDERS_CUTS,
     tag:          str   = "",
+    variable_sr:  bool  = True,
 ):
     """
     Run the congestion-extended Benders decomposition with joint (c, p) decisions.
@@ -303,15 +327,15 @@ def main(
     demand_path = cfg.OUTPUTS_DIR / "candidate_demand.csv"
     if demand_path.exists():
         demand_df = pd.read_csv(demand_path)
-        # Invalidate if built with flat stop rate (missing through_gap_km)
-        if "through_gap_km" not in demand_df.columns:
-            print("Demand file uses flat stop rate — regenerating with variable SR …")
-            demand_df = build_demand()
+        cached_var = "through_gap_km" in demand_df.columns
+        if cached_var != variable_sr:
+            mode_str = "variable SR" if variable_sr else "flat SR"
+            print(f"Demand SR mode mismatch — regenerating with {mode_str} …")
+            demand_df = build_demand(variable_sr=variable_sr)
         else:
-            print("Loading pre-computed candidate demand (variable stop rate) …")
+            print("Loading pre-computed candidate demand …")
     else:
-        print("Building candidate demand …")
-        demand_df = build_demand()
+        demand_df = build_demand(variable_sr=variable_sr)
 
     # ── Existing charger demand + fixed W_q ──────────────────────────────────
     from demand import build_existing_demand
@@ -361,6 +385,12 @@ def main(
         session_min = 60.0 * cfg.E_SESSION_KWH / float(row["p_kw"])
         wq_lookup[key]      = wq
         w_total_lookup[key] = wq + session_min
+
+    # lambda_lookup : (lon, lat) → λ_k  — used for stability constraint in master
+    lambda_lookup = {
+        (round(float(r["lon"]), 6), round(float(r["lat"]), 6)): float(r["lambda_k"])
+        for _, r in demand_df.iterrows()
+    }
 
     # ── Load nodes and edges ──────────────────────────────────────────────────
     print("Loading nodes and edges …")
@@ -423,7 +453,7 @@ def main(
         # ── Solve master ──────────────────────────────────────────────────────
         solver, x, w, eta, feas_idx = build_master_congestion(
             feas_list, city_pairs, cuts, w_total_lookup,
-            beta, gamma, c_min, c_max, power_tiers,
+            beta, gamma, c_min, c_max, power_tiers, lambda_lookup,
         )
         status = solver.Solve()
 
@@ -649,9 +679,11 @@ if __name__ == "__main__":
                         help="Grid-connection cost per kW γ (default %(default)s)")
     parser.add_argument("--c-max", type=int,   default=cfg.C_MAX,
                         help="Maximum chargers per station (default %(default)s)")
-    parser.add_argument("--tag",   type=str,   default="",
-                        help="Output file suffix, e.g. 'g05' → results_congestion_g05.csv")
+    parser.add_argument("--tag",      type=str,   default="",
+                        help="Output file suffix, e.g. 'v2' → results_congestion_v2.csv")
+    parser.add_argument("--fixed-sr", action="store_true",
+                        help="Use flat 5%% stop rate instead of corridor-aware variable SR")
     args = parser.parse_args()
 
     main(beta=args.beta, gamma=args.gamma, c_min=cfg.C_MIN,
-         c_max=args.c_max, tag=args.tag)
+         c_max=args.c_max, tag=args.tag, variable_sr=not args.fixed_sr)

@@ -335,11 +335,13 @@ def main(
         wq_df = pd.read_csv(wq_path)
         if "p_kw" in wq_df.columns:
             existing_tiers = sorted(wq_df["p_kw"].unique().astype(int).tolist())
-            if existing_tiers == sorted(power_tiers):
+            if existing_tiers != sorted(power_tiers):
+                print(f"  W_q table tiers {existing_tiers} ≠ {sorted(power_tiers)} — regenerating")
+            elif demand_path.exists() and wq_path.stat().st_mtime < demand_path.stat().st_mtime:
+                print("  Demand updated since last W_q table — regenerating")
+            else:
                 need_regen = False
                 print("Loading pre-computed W_q table …")
-            else:
-                print(f"  W_q table tiers {existing_tiers} ≠ {sorted(power_tiers)} — regenerating")
         else:
             print("  W_q table missing p_kw column — regenerating")
     if need_regen:

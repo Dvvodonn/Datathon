@@ -302,8 +302,13 @@ def main(
     # ── Candidate demand ──────────────────────────────────────────────────────
     demand_path = cfg.OUTPUTS_DIR / "candidate_demand.csv"
     if demand_path.exists():
-        print("Loading pre-computed candidate demand …")
         demand_df = pd.read_csv(demand_path)
+        # Invalidate if built with flat stop rate (missing through_gap_km)
+        if "through_gap_km" not in demand_df.columns:
+            print("Demand file uses flat stop rate — regenerating with variable SR …")
+            demand_df = build_demand()
+        else:
+            print("Loading pre-computed candidate demand (variable stop rate) …")
     else:
         print("Building candidate demand …")
         demand_df = build_demand()

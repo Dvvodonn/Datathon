@@ -15,7 +15,15 @@ EV_PENETRATION   = 0.05    # fraction of highway traffic assumed to be EV
                             # column named 'ev_penetration', that overrides this
 PEAK_HOUR_FACTOR = 0.10    # share of daily AADT that falls in the single
                             # busiest hour (standard value for Spanish highways)
-STOP_RATE        = 0.05    # fraction of passing EVs that stop to charge
+STOP_RATE        = 0.05    # flat stop rate — used only for existing charger demand
+
+# ── Variable stop rate (corridor-aware, logistic of through-gap) ───────────────
+STOP_RATE_MIN    = 0.02    # opportunistic charging floor
+STOP_RATE_MAX    = 0.92    # near-forced stop ceiling
+D50_KM           = 125.0   # through-gap (km) at which 50% of EVs stop
+                            # = MAX_EDGE_KM / 2 = 250 / 2
+STOP_STEEPNESS   = 40.0    # logistic steepness (km); saturates at ~250 km gap
+                            # = MAX_EDGE_KM / 6
 
 # ── Charger power tiers (new stations only) ────────────────────────────────────
 POWER_TIERS      = [50, 100, 150, 200, 250, 350]  # kW options for new station builds

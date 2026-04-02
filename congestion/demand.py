@@ -324,25 +324,118 @@ def add_usage_crosscheck(
     return result
 
 
-# ── 6. Convert AADT → λ_k ────────────────────────────────────────────────────
+# ── 6a. Corridor-aware through-gap computation ────────────────────────────────
+
+def compute_corridor_gaps(
+    demand_df:  pd.DataFrame,
+    edges_path: str = cfg.EDGES_250_CSV,
+) -> pd.Series:
+    """
+    For each candidate k, compute the through-gap G_k (km) — the total road
+    distance between the nearest existing charger behind k and the nearest
+    existing charger ahead of k along the same corridor.
+
+    Uses edges_250.csv (pre-computed Dijkstra distances between all node pairs)
+    to find road-network distance to the nearest existing charger in either
+    direction.  Through-gap is approximated as 2 × d_nearest_charger, which
+    assumes k sits roughly midway between its two neighbouring chargers.
+
+    Returns a Series of through_gap_km indexed as demand_df.
+    """
+    print("  Computing corridor gaps from edges_250 …")
+    edges = pd.read_csv(edges_path,
+                        usecols=["lon_a", "lat_a", "lon_b", "lat_b",
+                                 "a_is_charger", "b_is_charger", "distance_km"])
+
+    # Case 1: candidate is endpoint A, existing charger is endpoint B
+    c1 = (edges[edges["b_is_charger"] == 1]
+          [["lon_a", "lat_a", "distance_km"]]
+          .rename(columns={"lon_a": "lon", "lat_a": "lat"}))
+
+    # Case 2: existing charger is endpoint A, candidate is endpoint B
+    c2 = (edges[edges["a_is_charger"] == 1]
+          [["lon_b", "lat_b", "distance_km"]]
+          .rename(columns={"lon_b": "lon", "lat_b": "lat"}))
+
+    all_to_ec = pd.concat([c1, c2], ignore_index=True)
+    all_to_ec["lon"] = all_to_ec["lon"].round(6)
+    all_to_ec["lat"] = all_to_ec["lat"].round(6)
+
+    # Minimum road distance from each node to any existing charger
+    min_dist = (all_to_ec
+                .groupby(["lon", "lat"])["distance_km"]
+                .min()
+                .rename("d_nearest_charger_km"))
+
+    # Join back to demand_df
+    demand_df = demand_df.copy()
+    demand_df["_lon"] = demand_df["lon"].round(6)
+    demand_df["_lat"] = demand_df["lat"].round(6)
+
+    d_nearest = (demand_df
+                 .set_index(["_lon", "_lat"])
+                 .index
+                 .map(min_dist.to_dict()))
+    d_nearest = pd.Series(d_nearest, index=demand_df.index).fillna(250.0)
+    d_nearest = d_nearest.clip(upper=250.0)
+
+    # Through-gap = 2 × d_nearest (symmetric approximation)
+    through_gap = (2 * d_nearest).clip(upper=250.0)
+
+    n_missing = (d_nearest >= 250.0).sum()
+    print(f"  Through-gap: median={through_gap.median():.1f} km  "
+          f"min={through_gap.min():.1f}  max={through_gap.max():.1f}  "
+          f"capped-at-250: {n_missing:,}")
+    return through_gap
+
+
+# ── 6b. Variable stop rate (logistic of through-gap) ─────────────────────────
+
+def compute_variable_stop_rates(
+    through_gap_km: pd.Series,
+    r_min:      float = cfg.STOP_RATE_MIN,
+    r_max:      float = cfg.STOP_RATE_MAX,
+    d50:        float = cfg.D50_KM,
+    steepness:  float = cfg.STOP_STEEPNESS,
+) -> pd.Series:
+    """
+    Logistic stop rate as a function of corridor through-gap:
+
+        stop_rate(G) = r_min + (r_max - r_min) × σ((G - d50) / steepness)
+
+    Parameters calibrated so:
+      - stop_rate ≈ r_min  when G ≈ 0  (alternative charger very close)
+      - stop_rate = 0.47   when G = d50 = 125 km (half comfortable range)
+      - stop_rate ≈ r_max  when G = 250 km (model range limit → forced stop)
+    """
+    from scipy.special import expit
+    rates = r_min + (r_max - r_min) * expit((through_gap_km - d50) / steepness)
+    print(f"  Variable stop rates: min={rates.min():.3f}  "
+          f"median={rates.median():.3f}  max={rates.max():.3f}")
+    return rates
+
+
+# ── 6c. Convert AADT → λ_k ───────────────────────────────────────────────────
 
 def compute_lambda(
     result: pd.DataFrame,
     ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
-    stop_rate:        float = cfg.STOP_RATE,
+    stop_rate = cfg.STOP_RATE,   # float or pd.Series
 ) -> pd.DataFrame:
     """
     Convert AADT (vehicles/day) to EV arrival rate λ_k (vehicles/hour).
 
         λ_k = AADT × ev_penetration × peak_hour_factor × stop_rate
+
+    stop_rate may be a scalar (flat) or a per-row Series (corridor-aware).
     """
     pen = result.get("ev_penetration", pd.Series(ev_penetration, index=result.index))
     pen = pen.fillna(ev_penetration)
 
     result = result.copy()
-    result["stop_rate"] = stop_rate
-    result["lambda_k"]  = result["aadt_assigned"] * pen * peak_hour_factor * stop_rate
+    result["stop_rate"] = stop_rate   # scalar broadcasts; Series aligns by index
+    result["lambda_k"]  = result["aadt_assigned"] * pen * peak_hour_factor * result["stop_rate"]
     result["lambda_k"]  = result["lambda_k"].clip(lower=0.0)
 
     print(f"  λ_k stats (EV vehicles/hour):")
@@ -360,23 +453,28 @@ def build_demand(
     nodes_path:       str   = cfg.NODES_CSV,
     flow_csv:         str   = cfg.ROAD_FLOW_CSV,
     edges_path:       str   = cfg.EDGES_GPKG,
+    edges_250_path:   str   = cfg.EDGES_250_CSV,
     cuts_path:        str   = cfg.BENDERS_CUTS,
     ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
-    stop_rate:        float = cfg.STOP_RATE,
 ) -> pd.DataFrame:
     """
-    Full demand pipeline. Returns a DataFrame of feasible candidate locations
-    with columns: lat, lon, name, aadt_assigned, impute_tier, edge_dist_m,
-                  highway_class, stop_rate, usage_count, lambda_k.
+    Full demand pipeline with corridor-aware variable stop rates.
 
-    Also writes congestion/outputs/candidate_demand.csv.
+    Stop rate per candidate is a logistic function of the through-gap to the
+    nearest existing charger along the road corridor (edges_250.csv distances).
+    This replaces the flat STOP_RATE constant.
+
+    Returns a DataFrame with columns:
+      lat, lon, name, aadt_assigned, impute_tier, edge_dist_m,
+      highway_class, through_gap_km, stop_rate, usage_count, lambda_k
+
+    Writes congestion/outputs/candidate_demand.csv.
     """
     cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("=== Demand pipeline ===")
+    print("=== Demand pipeline (variable stop rate) ===")
 
-    # Load candidate stations (feasible locations only)
     nodes = pd.read_csv(nodes_path)
     candidates = nodes[nodes["is_feasible_location"] == 1].copy().reset_index(drop=True)
     print(f"  Candidates (feasible locations): {len(candidates):,}")
@@ -387,23 +485,20 @@ def build_demand(
         crs="EPSG:4326",
     ).to_crs("EPSG:25830")
 
-    # AADT assignment from road_edges_flow.csv (also sets highway_class)
     assigned = assign_aadt_from_flow(candidates_gdf, flow_csv, edges_path)
-
-    # Drop GeoDataFrame back to plain DataFrame
     result = pd.DataFrame(assigned.drop(columns=["geometry"]))
-
-    # Attach Benders usage-count cross-check
     result = add_usage_crosscheck(result, cuts_path)
 
-    # Compute λ_k
-    result = compute_lambda(result, ev_penetration, peak_hour_factor, stop_rate)
+    # Corridor-aware through-gap → variable stop rate
+    through_gap   = compute_corridor_gaps(result, edges_250_path)
+    stop_rates    = compute_variable_stop_rates(through_gap)
+    result["through_gap_km"] = through_gap.values
+    result = compute_lambda(result, ev_penetration, peak_hour_factor, stop_rates.values)
 
-    # Keep a clean ordered column set
     keep_cols = [
         "lat", "lon", "name",
         "aadt_assigned", "impute_tier", "edge_dist_m",
-        "highway_class", "stop_rate",
+        "highway_class", "through_gap_km", "stop_rate",
         "usage_count", "lambda_k",
     ]
     result = result[[c for c in keep_cols if c in result.columns]]
@@ -411,7 +506,6 @@ def build_demand(
     out_path = cfg.OUTPUTS_DIR / "candidate_demand.csv"
     result.to_csv(out_path, index=False)
     print(f"  Saved → {out_path}  ({len(result):,} rows)")
-
     return result
 
 

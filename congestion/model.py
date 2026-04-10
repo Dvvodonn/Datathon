@@ -33,10 +33,11 @@ Warm start
 
 Run
 ---
-    python congestion/model.py                    # default gamma and beta
+    python congestion/model.py                    # default gamma, fixed cost, beta
     python congestion/model.py --beta 2.0
     python congestion/model.py --gamma 0.5
-    python congestion/model.py --gamma 1.0 --beta 1.0
+    python congestion/model.py --fixed-cost 30000
+    python congestion/model.py --gamma 1.0 --fixed-cost 60000 --beta 1.0
 """
 
 import argparse
@@ -68,6 +69,20 @@ from queuing import precompute_wq_table
 
 def nkey(lon, lat):
     return (round(float(lon), 6), round(float(lat), 6))
+
+
+def _is_cache_stale(cache_path, dependencies):
+    """Return True if cache_path is missing or older than any dependency."""
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return True
+
+    cache_mtime = cache_path.stat().st_mtime
+    for dep in dependencies:
+        dep_path = Path(dep)
+        if dep_path.exists() and dep_path.stat().st_mtime > cache_mtime:
+            return True
+    return False
 
 
 # ── Dijkstra (identical logic to model_1.py) ─────────────────────────────────
@@ -144,7 +159,9 @@ def _solve_source(src):
 
 def build_master_congestion(
     feas_list, city_pairs, cuts, w_total_lookup,
-    beta, gamma, c_min, c_max, power_tiers, lambda_lookup,
+    beta, gamma, fixed_cost, c_min, c_max, power_tiers, lambda_lookup,
+    phi=0.0, coverable_gaps=None, coverable_gaps_2hop=None,
+    master_time_limit_ms=300_000,
 ):
     """
     Master MIP with w[i][j_c][j_p] ∈ {0,1} decision variables.
@@ -169,11 +186,12 @@ def build_master_congestion(
     w_total_lookup : dict  (lon, lat, c, p_kw) → W_q + session_minutes
     lambda_lookup  : dict  (lon, lat) → λ_k  (EV arrivals / hour)
     gamma          : float  cost per kW of total station power
+    fixed_cost     : float  cost per opened station x[k]
     power_tiers    : list   of kW values, e.g. [50, 100, 150, 200, 250, 350]
     """
     solver = pywraplp.Solver.CreateSolver("SCIP")
     solver.SuppressOutput()
-    solver.SetTimeLimit(300_000)  # 5 min per master solve
+    solver.SetTimeLimit(master_time_limit_ms)
 
     feas_idx  = {k: i for i, k in enumerate(feas_list)}
     n         = len(feas_list)
@@ -195,22 +213,23 @@ def build_master_congestion(
     eta = {(u, v): solver.NumVar(0, solver.infinity(), f"eta_{u}_{v}")
            for (u, v) in city_pairs}
 
-    # ── Stability: fix w[i][j_c][j_p] = 0 whenever ρ = λ/(c·μ) ≥ 1 ──────────
-    # This prevents the solver from placing a station it cannot actually serve.
-    # If all (c, p) combinations are infeasible for location i, x[i] is forced
-    # to 0 by the linking constraint below.
-    n_fixed = 0
+    # For locations overdemanded even at c_max (ρ ≥ 1 at c=7), force c=c_max.
+    # These stations pay WQ_LARGE_PENALTY regardless of charger count, so without
+    # this constraint the optimizer would pick c_min (cheapest grid cost, same
+    # penalty). Forcing c_max ensures max capacity at the most congested sites.
+    # For all other locations, no constraint: optimizer picks c freely.
+    n_forced = 0
     for i, k in enumerate(feas_list):
         klon, klat = float(k[0]), float(k[1])
         lam_k = lambda_lookup.get((klon, klat), 0.0)
         for j_p, p in enumerate(power_tiers):
             mu_p = p / cfg.E_SESSION_KWH
-            for j_c, c in enumerate(range(c_min, c_max + 1)):
-                if c * mu_p <= lam_k:   # ρ ≥ 1 — unstable
+            if c_max * mu_p <= lam_k:   # ρ ≥ 1 even at c_max — force c=c_max
+                for j_c, c in enumerate(range(c_min, c_max)):
                     w[i][j_c][j_p].SetUb(0.0)
-                    n_fixed += 1
-    if n_fixed:
-        print(f"  Stability: fixed {n_fixed:,} w-vars to 0 (ρ ≥ 1)")
+                    n_forced += 1
+    if n_forced:
+        print(f"  Overdemand: forced {n_forced:,} w-vars to 0 (ρ ≥ 1 at c_max → fix c=c_max)")
 
     # ── Linking: Σ_{c,p} w[i][j_c][j_p] == x[i] ──────────────────────────────
     for i in range(n):
@@ -264,14 +283,66 @@ def build_master_congestion(
             for k in nodes:
                 ct.SetCoefficient(x[feas_idx[tuple(k)]], delta)
 
+    # ── phi corridor-coverage constraint ─────────────────────────────────────
+    # 1-hop gaps (100–200 km): a single station k covers gap (u,v) iff
+    #   dist(u,k) ≤ 100 AND dist(k,v) ≤ 100
+    # 2-hop gaps (200–250 km): a pair (K1,K2) covers gap (u,v) iff
+    #   dist(u,K1) ≤ 100 AND dist(K1,K2) ≤ 100 AND dist(K2,v) ≤ 100
+    #
+    # phi=0 → no constraint
+    # phi=1 → every coverable gap (1-hop + 2-hop) must be covered
+    if phi > 0.0 and (coverable_gaps or coverable_gaps_2hop):
+        n_1hop      = len(coverable_gaps or [])
+        n_2hop      = len(coverable_gaps_2hop or [])
+        min_covered = math.ceil(phi * (n_1hop + n_2hop))
+
+        # ── 1-hop z variables ────────────────────────────────────────────────
+        z1 = [solver.BoolVar(f"z1_{g}") for g in range(n_1hop)]
+        for g, covering_indices in enumerate(coverable_gaps or []):
+            ct = solver.Constraint(-solver.infinity(), 0.0)
+            ct.SetCoefficient(z1[g], 1.0)
+            for idx in covering_indices:
+                ct.SetCoefficient(x[idx], -1.0)
+
+        # ── 2-hop relay variables (continuous) ──────────────────────────────
+        # For each 2-hop gap g and each K1 that can relay it, introduce
+        # r[g][k1] ∈ [0,1] (CONTINUOUS — bounded by binary x's, so integer
+        # at any feasible solution; avoids 24k extra branch-on variables):
+        #   r[g][k1] ≤ x[k1]                          (K1 must be open)
+        #   r[g][k1] ≤ Σ_{k2 ∈ valid_K2s} x[k2]      (at least one K2 open)
+        # At any integer solution: r = min(x[K1], Σ x[K2]) ∈ {0,1}. Correct.
+        z2 = [solver.BoolVar(f"z2_{g}") for g in range(n_2hop)]
+        for g, relay_groups in enumerate(coverable_gaps_2hop or []):
+            # relay_groups: dict {k1_idx: [k2_idx, ...]}
+            ct_z = solver.Constraint(-solver.infinity(), 0.0)
+            ct_z.SetCoefficient(z2[g], 1.0)
+            for k1_idx, k2_indices in relay_groups.items():
+                r = solver.NumVar(0.0, 1.0, f"r_{g}_{k1_idx}")  # continuous
+                # r ≤ x[K1]
+                ct1 = solver.Constraint(-solver.infinity(), 0.0)
+                ct1.SetCoefficient(r, 1.0)
+                ct1.SetCoefficient(x[k1_idx], -1.0)
+                # r ≤ Σ x[K2]
+                ct2 = solver.Constraint(-solver.infinity(), 0.0)
+                ct2.SetCoefficient(r, 1.0)
+                for k2_idx in k2_indices:
+                    ct2.SetCoefficient(x[k2_idx], -1.0)
+                # z2[g] ≤ Σ r[g][k1]
+                ct_z.SetCoefficient(r, -1.0)
+
+        # ── Unified global coverage: Σ z1 + Σ z2 ≥ min_covered ─────────────
+        ct = solver.Constraint(float(min_covered), solver.infinity())
+        for zv in z1 + z2:
+            ct.SetCoefficient(zv, 1.0)
+
     return solver, x, w, eta, feas_idx
 
 
 # ── Upper-bound helper ────────────────────────────────────────────────────────
 
 def _compute_ub(total_t_opt, w_vals, w_total_lookup,
-                feas_list, beta, gamma, c_min, c_max, power_tiers):
-    """Compute upper bound: routing cost + grid cost + total driver stop time."""
+                feas_list, beta, gamma, fixed_cost, c_min, c_max, power_tiers):
+    """Compute upper bound: routing + grid + opening + total driver stop time."""
     grid_cost   = 0.0
     driver_cost = 0.0
     for i, k in enumerate(feas_list):
@@ -289,18 +360,22 @@ def _compute_ub(total_t_opt, w_vals, w_total_lookup,
 def main(
     beta:         float = cfg.BETA,
     gamma:        float = cfg.GAMMA,
+    fixed_cost:   float = cfg.FIXED_COST,
     c_min:        int   = cfg.C_MIN,
     c_max:        int   = cfg.C_MAX,
     power_tiers:  list  = None,
     cuts_in_path: str   = cfg.BENDERS_CUTS,
     tag:          str   = "",
     variable_sr:  bool  = True,
+    phi:          float = cfg.PHI,
+    outputs_dir:  Path  = None,
 ):
     """
     Run the congestion-extended Benders decomposition with joint (c, p) decisions.
 
     Objective per station:
-        gamma * c * p_kW           (grid-connection cost ∝ total station power)
+        fixed_cost                (station opening cost)
+      + gamma * c * p_kW          (grid-connection cost ∝ total station power)
       + beta  * W(λ_k, μ(p), c)   (total driver stop time = W_q + session time)
 
     Using W instead of W_q alone drives the solver to prefer higher-kW chargers at
@@ -315,20 +390,34 @@ def main(
         power_tiers = cfg.POWER_TIERS
 
     cfg.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(outputs_dir) if outputs_dir is not None else cfg.OUTPUTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     n_workers = max(1, mp.cpu_count() - 1)
 
     print(f"\n{'='*65}")
-    print(f"Congestion model  |  β={beta}  γ={gamma}  c∈[{c_min},{c_max}]  "
-          f"tiers={power_tiers} kW")
-    print(f"  Objective: γ·c·p (grid cost) + β·W(λ,μ,c) (total stop time)")
+    print(f"Congestion model  |  β={beta}  γ={gamma}  F={fixed_cost}  "
+          f"c∈[{c_min},{c_max}]  tiers={power_tiers} kW")
+    print(f"  Objective: F·x + γ·c·p (grid cost) + β·W(λ,μ,c) (total stop time)")
     print(f"{'='*65}")
 
     # ── Candidate demand ──────────────────────────────────────────────────────
     demand_path = cfg.OUTPUTS_DIR / "candidate_demand.csv"
+    demand_deps = [
+        Path(cfg.NODES_CSV),
+        Path(cfg.ROAD_FLOW_CSV),
+        Path(cfg.EDGES_GPKG),
+        Path(cfg.EDGES_250_CSV),
+        Path(cfg.BENDERS_CUTS),
+        Path(cfg.__file__),
+        Path(__file__).with_name("demand.py"),
+    ]
     if demand_path.exists():
         demand_df = pd.read_csv(demand_path)
         cached_var = "through_gap_km" in demand_df.columns
-        if cached_var != variable_sr:
+        if _is_cache_stale(demand_path, demand_deps):
+            print("Candidate demand cache is stale — regenerating …")
+            demand_df = build_demand(variable_sr=variable_sr)
+        elif cached_var != variable_sr:
             mode_str = "variable SR" if variable_sr else "flat SR"
             print(f"Demand SR mode mismatch — regenerating with {mode_str} …")
             demand_df = build_demand(variable_sr=variable_sr)
@@ -342,12 +431,19 @@ def main(
     from queuing import compute_existing_wq
 
     existing_path = cfg.OUTPUTS_DIR / "existing_demand.csv"
-    if existing_path.exists():
+    existing_deps = [
+        Path(cfg.NODES_CSV),
+        Path(cfg.ROAD_FLOW_CSV),
+        Path(cfg.EDGES_GPKG),
+        Path(cfg.__file__),
+        Path(__file__).with_name("demand.py"),
+    ]
+    if existing_path.exists() and not _is_cache_stale(existing_path, existing_deps):
         print("Loading pre-computed existing charger demand …")
         existing_df = pd.read_csv(existing_path)
     else:
         print("Building existing charger demand …")
-        existing_df = build_existing_demand()
+        existing_df = build_existing_demand(variable_sr=variable_sr)
 
     print("Computing fixed W_q for existing chargers …")
     fixed_existing_wq, existing_wq_df = compute_existing_wq(existing_df)
@@ -357,10 +453,21 @@ def main(
     need_regen = True
     if wq_path.exists():
         wq_df = pd.read_csv(wq_path)
-        if "p_kw" in wq_df.columns:
+        if {"p_kw", "c"}.issubset(wq_df.columns):
             existing_tiers = sorted(wq_df["p_kw"].unique().astype(int).tolist())
+            c_values = wq_df["c"].astype(int)
+            existing_c_min = int(c_values.min())
+            existing_c_max = int(c_values.max())
             if existing_tiers != sorted(power_tiers):
                 print(f"  W_q table tiers {existing_tiers} ≠ {sorted(power_tiers)} — regenerating")
+            elif (existing_c_min, existing_c_max) != (c_min, c_max):
+                print(f"  W_q table c-range [{existing_c_min},{existing_c_max}] ≠ "
+                      f"[{c_min},{c_max}] — regenerating")
+            elif _is_cache_stale(
+                wq_path,
+                [demand_path, Path(cfg.__file__), Path(__file__).with_name("queuing.py")],
+            ):
+                print("  Demand or queue config changed since last W_q table — regenerating")
             elif demand_path.exists() and wq_path.stat().st_mtime < demand_path.stat().st_mtime:
                 print("  Demand updated since last W_q table — regenerating")
             else:
@@ -431,6 +538,127 @@ def main(
           f"{len(city_pairs):,} city pairs  |  "
           f"{len(cuts):,} warm-start cuts")
 
+    # ── phi corridor-coverage: pre-compute bridgeable city-pair gaps ─────────
+    # 1-hop gaps (100–200 km): single station k covers (u,v) iff
+    #   dist(u,k) ≤ 100 AND dist(k,v) ≤ 100
+    # 2-hop gaps (200–250 km): pair (K1,K2) covers (u,v) iff
+    #   dist(u,K1) ≤ 100 AND dist(K1,K2) ≤ 100 AND dist(K2,v) ≤ 100
+    # Only gaps with at least one covering station/pair are kept.
+    coverable_gaps = []
+    coverable_gaps_2hop = []
+    if phi > 0.0:
+        print("  Pre-computing bridgeable city-pair gaps for phi constraint …")
+        feas_idx_map = {k: i for i, k in enumerate(feas_list)}
+        _edges = edges_df.copy()
+        _edges["_ka"] = list(zip(_edges["lon_a"].round(6), _edges["lat_a"].round(6)))
+        _edges["_kb"] = list(zip(_edges["lon_b"].round(6), _edges["lat_b"].round(6)))
+
+        # long city-to-city edges (100 < dist ≤ 200 km)
+        city_long = _edges[
+            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(city_keys) &
+            (_edges["distance_km"] > cfg.PHI_MAX_GAP_KM) &
+            (_edges["distance_km"] <= 2 * cfg.PHI_MAX_GAP_KM)
+        ][["_ka", "_kb", "distance_km"]].copy()
+
+        # build city → nearby chargers (≤ 100 km)
+        city_to_charger = {}
+        for _, r in _edges[
+            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(charger_keys) &
+            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
+        ].iterrows():
+            city_to_charger.setdefault(r["_ka"], set()).add(r["_kb"])
+        for _, r in _edges[
+            _edges["_ka"].isin(charger_keys) & _edges["_kb"].isin(city_keys) &
+            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
+        ].iterrows():
+            city_to_charger.setdefault(r["_kb"], set()).add(r["_ka"])
+
+        # build city → nearby feasible candidates (≤ 100 km)
+        city_to_feas = {}
+        feas_set_keys = set(feas_list)
+        for _, r in _edges[
+            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(feas_set_keys) &
+            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
+        ].iterrows():
+            city_to_feas.setdefault(r["_ka"], set()).add(r["_kb"])
+        for _, r in _edges[
+            _edges["_ka"].isin(feas_set_keys) & _edges["_kb"].isin(city_keys) &
+            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
+        ].iterrows():
+            city_to_feas.setdefault(r["_kb"], set()).add(r["_ka"])
+
+        seen_pairs = set()
+        for _, r in city_long.iterrows():
+            u, v = r["_ka"], r["_kb"]
+            if (v, u) in seen_pairs:
+                continue
+            seen_pairs.add((u, v))
+            # skip if already bridged by existing charger
+            if city_to_charger.get(u, set()) & city_to_charger.get(v, set()):
+                continue
+            # covering candidate stations
+            covering_keys = city_to_feas.get(u, set()) & city_to_feas.get(v, set())
+            if not covering_keys:
+                continue
+            covering_indices = [feas_idx_map[k] for k in covering_keys if k in feas_idx_map]
+            if covering_indices:
+                coverable_gaps.append(covering_indices)
+
+        print(f"  phi={phi}  1-hop bridgeable gaps (100-200km): {len(coverable_gaps)}"
+              f"  (threshold={cfg.PHI_MAX_GAP_KM} km)")
+
+        # ── 2-hop gaps (200–250 km) ───────────────────────────────────────────
+        # Build feas→feas adjacency within 100 km using vectorised groupby
+        # (reuses _edges already loaded; no extra CSV read needed)
+        feas_keys_set = set(feas_idx_map.keys())
+        _ff = _edges[
+            _edges["_ka"].isin(feas_keys_set) & _edges["_kb"].isin(feas_keys_set) &
+            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
+        ][["_ka", "_kb"]]
+        feas_to_feas = _ff.groupby("_ka")["_kb"].apply(set).to_dict()
+        for ka, kb_set in _ff.groupby("_kb")["_ka"].apply(set).items():
+            feas_to_feas[ka] = feas_to_feas.get(ka, set()) | kb_set
+
+        city_very_long = _edges[
+            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(city_keys) &
+            (_edges["distance_km"] > 2 * cfg.PHI_MAX_GAP_KM)
+        ][["_ka", "_kb"]].copy()
+
+        # Cap relay K1s per gap: keep up to MAX_RELAY_K1 with most K2 options.
+        # K1s with more K2 options give the optimizer more flexibility.
+        MAX_RELAY_K1 = 20
+
+        seen_2hop = set()
+        for _, row in city_very_long.iterrows():
+            u, v = row["_ka"], row["_kb"]
+            if (v, u) in seen_2hop:
+                continue
+            seen_2hop.add((u, v))
+            feas_near_u = city_to_feas.get(u, set())
+            feas_near_v = city_to_feas.get(v, set())
+            relay_groups = {}
+            for k1_key in feas_near_u:
+                k1_idx = feas_idx_map.get(k1_key)
+                if k1_idx is None:
+                    continue
+                k2_indices = [
+                    feas_idx_map[k2_key]
+                    for k2_key in feas_to_feas.get(k1_key, set()) & feas_near_v
+                    if k2_key in feas_idx_map
+                ]
+                if k2_indices:
+                    relay_groups[k1_idx] = k2_indices
+            if relay_groups:
+                # Keep K1s with the most K2 options (most routing flexibility)
+                trimmed = dict(
+                    sorted(relay_groups.items(), key=lambda kv: -len(kv[1]))[:MAX_RELAY_K1]
+                )
+                coverable_gaps_2hop.append(trimmed)
+
+        print(f"  phi={phi}  2-hop bridgeable gaps (200-250km): {len(coverable_gaps_2hop)}"
+              f"  of {len(seen_2hop)} total very-long gaps"
+              f"  (relay K1 cap={MAX_RELAY_K1})")
+
     full_nodes = city_set | charger_keys | set(feas_list)
     adj_dict   = dict(adj)
 
@@ -451,9 +679,12 @@ def main(
         t0 = timer.time()
 
         # ── Solve master ──────────────────────────────────────────────────────
+        master_tl = 900_000 if phi > 0.0 else 300_000  # 15 min for phi>0, 5 min otherwise
         solver, x, w, eta, feas_idx = build_master_congestion(
             feas_list, city_pairs, cuts, w_total_lookup,
-            beta, gamma, c_min, c_max, power_tiers, lambda_lookup,
+            beta, gamma, fixed_cost, c_min, c_max, power_tiers, lambda_lookup,
+            phi=phi, coverable_gaps=coverable_gaps, coverable_gaps_2hop=coverable_gaps_2hop,
+            master_time_limit_ms=master_tl,
         )
         status = solver.Solve()
 
@@ -553,7 +784,8 @@ def main(
                                 cuts_added += 1
 
         current_ub = _compute_ub(total_t_opt, w_vals, w_total_lookup,
-                                  feas_list, beta, gamma, c_min, c_max, power_tiers)
+                                  feas_list, beta, gamma, fixed_cost,
+                                  c_min, c_max, power_tiers)
 
         if current_ub < upper_bound:
             upper_bound = current_ub
@@ -578,10 +810,11 @@ def main(
 
     # ── Save cuts ─────────────────────────────────────────────────────────────
     tag_str = f"_{tag}" if tag else ""
-    cuts_out = cfg.OUTPUTS_DIR / f"congestion_cuts{tag_str}.json"
+    cuts_out = out_dir / f"congestion_cuts{tag_str}.json"
     with open(cuts_out, "w") as f:
         json.dump({
-            "beta": beta, "gamma": gamma, "c_min": c_min, "c_max": c_max,
+            "beta": beta, "gamma": gamma, "fixed_cost": fixed_cost,
+            "c_min": c_min, "c_max": c_max,
             "power_tiers": power_tiers,
             "feas_list":  [list(k) for k in feas_list],
             "city_pairs": [[list(u), list(v)] for u, v in city_pairs],
@@ -628,9 +861,11 @@ def main(
     }
     nodes_result["lambda_k"] = nodes_result["key"].apply(
         lambda k: round(demand_keys.get(k, 0.0), 6))
+    nodes_result["gamma"] = gamma
+    nodes_result["fixed_cost"] = fixed_cost
 
     nodes_result = nodes_result.drop(columns=["key"])
-    results_out = cfg.OUTPUTS_DIR / f"results_congestion{tag_str}.csv"
+    results_out = out_dir / f"results_congestion{tag_str}.csv"
     nodes_result.to_csv(results_out, index=False)
     print(f"Results saved → {results_out}")
 
@@ -638,12 +873,14 @@ def main(
     built = nodes_result[nodes_result["x_built"] == 1]
     total_system_wq = (built["wq_minutes"].sum() + fixed_existing_wq
                        if len(built) else fixed_existing_wq)
+    total_open_cost = len(built) * fixed_cost
     print(f"\n{'='*65}")
     print(f"Objective (UB)               : {upper_bound:.2f}")
     print(f"Lower bound                  : {lower_bound:.2f}")
     print(f"Stations built               : {len(built)}")
     if len(built) > 0:
         print(f"Chargers total               : {int(built['c_built'].sum())}")
+        print(f"Opening cost total           : {total_open_cost:.1f}")
         print(f"Power dist (kW)              : "
               f"{dict(built['p_built_kw'].value_counts().sort_index())}")
         print(f"Charger dist                 : "
@@ -677,13 +914,18 @@ if __name__ == "__main__":
                         help="Driver stop-time weight β (default %(default)s)")
     parser.add_argument("--gamma", type=float, default=cfg.GAMMA,
                         help="Grid-connection cost per kW γ (default %(default)s)")
+    parser.add_argument("--fixed-cost", type=float, default=cfg.FIXED_COST,
+                        help="Station opening cost F (default %(default)s)")
     parser.add_argument("--c-max", type=int,   default=cfg.C_MAX,
                         help="Maximum chargers per station (default %(default)s)")
     parser.add_argument("--tag",      type=str,   default="",
                         help="Output file suffix, e.g. 'v2' → results_congestion_v2.csv")
     parser.add_argument("--fixed-sr", action="store_true",
                         help="Use flat 5%% stop rate instead of corridor-aware variable SR")
+    parser.add_argument("--phi", type=float, default=cfg.PHI,
+                        help="Min fraction of stations on short gaps (≤100 km) (default %(default)s)")
     args = parser.parse_args()
 
-    main(beta=args.beta, gamma=args.gamma, c_min=cfg.C_MIN,
-         c_max=args.c_max, tag=args.tag, variable_sr=not args.fixed_sr)
+    main(beta=args.beta, gamma=args.gamma, fixed_cost=args.fixed_cost,
+         c_min=cfg.C_MIN, c_max=args.c_max, tag=args.tag,
+         variable_sr=not args.fixed_sr, phi=args.phi)

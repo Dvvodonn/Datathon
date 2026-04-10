@@ -10,7 +10,7 @@ rather than editing this file.
 from pathlib import Path
 
 # ── EV demand ─────────────────────────────────────────────────────────────────
-EV_PENETRATION   = 0.05    # fraction of highway traffic assumed to be EV
+EV_PENETRATION   = 0.07    # fraction of highway traffic assumed to be EV
                             # if the input AADT data contains a per-segment
                             # column named 'ev_penetration', that overrides this
 PEAK_HOUR_FACTOR = 0.13    # share of daily AADT that falls in the single
@@ -27,7 +27,7 @@ STOP_STEEPNESS   = 40.0    # logistic steepness (km); saturates at ~250 km gap
                             # = MAX_EDGE_KM / 6
 
 # ── Charger power tiers (new stations only) ────────────────────────────────────
-POWER_TIERS      = [50, 100, 150, 200, 250, 350]  # kW options for new station builds
+POWER_TIERS      = [150]                           # kW options for new station builds
 GAMMA            = 1.0              # cost per kW of total station power (minutes-equivalent)
                                     # station grid-connection cost = GAMMA * c * p_kW
                                     # calibrated so 1 kW ≈ 1 min-equivalent;
@@ -44,23 +44,29 @@ TIER2_MAX_KM     = 20.0    # between TIER1 and TIER2: class-mean imputation,
                             # marked tier=3 to flag higher uncertainty
 
 # ── M/M/c queuing ─────────────────────────────────────────────────────────────
-MU_PER_CHARGER   = 2.0     # service rate: vehicles per charger per hour
-                            # 2.0 ≈ 30-min session at ~150 kW
-                            # set to 4.0 for 350 kW, 1.33 for 50 kW
-C_MIN            = 1       # minimum chargers at an opened station
-C_MAX            = 10      # maximum chargers at an opened station
-                            # (decision variable upper bound)
-WQ_LARGE_PENALTY = 480.0   # waiting time (min) when queue is unstable (ρ ≥ 1)
-                            # 480 = 8-hour hard penalty; keeps solver away from
-                            # solutions that saturate a station
+MU_PER_CHARGER   = 2.0     # legacy fallback only; pipeline uses μ(p)=p/E_SESSION_KWH
+                            # kept for wq_minutes() default args and demo mode
+C_MIN            = 2       # minimum chargers at an opened station
+C_MAX            = 7       # maximum chargers at an opened station
+WQ_LARGE_PENALTY = 45.0    # waiting time (min) when queue is unstable (ρ ≥ 1)
+                            # 45 min ≈ realistic upper bound; beyond this drivers
+                            # divert to another charger or abandon the stop
 
 # ── Optimisation ──────────────────────────────────────────────────────────────
-ALPHA            = 100     # cost per charger built (minutes equivalent)
+ALPHA            = 100     # legacy baseline-model parameter (not used here)
                             # must equal ALPHA in models/model_1.py for
                             # comparable results across the two models
 BETA             = 1.0     # weight of congestion waiting penalty relative to
                             # travel time (both in minutes, so 1.0 is neutral)
                             # sweep this via model.run_efficient_frontier()
+FIXED_COST       = 0.0     # station opening cost F·x_k (minutes equivalent)
+                            # captures site-prep / civil-work cost independent
+                            # of charger count and power tier
+
+PHI              = 0.0     # min fraction of opened stations that must have
+                            # through_gap_km ≤ PHI_MAX_GAP_KM
+                            # 0 → unconstrained; 1 → all stations on short gaps
+PHI_MAX_GAP_KM   = 100.0   # gap threshold (km) that defines "short" corridors
 
 PENALTY_INFEASIBLE = 5_000 # virtual travel time (min) for disconnected pairs
 N_CITIES         = 235     # city clusters — must match models/model_1.py

@@ -336,9 +336,10 @@ def compute_corridor_gaps(
     existing charger ahead of k along the same corridor.
 
     Uses edges_250.csv (pre-computed Dijkstra distances between all node pairs)
-    to find road-network distance to the nearest existing charger in either
-    direction.  Through-gap is approximated as 2 × d_nearest_charger, which
-    assumes k sits roughly midway between its two neighbouring chargers.
+    to find road-network distance from each candidate to existing chargers.
+    Through-gap is approximated as d1 + d2, where d1 and d2 are the two
+    shortest distances to distinct existing chargers. If only one charger is
+    reachable within the 250 km graph horizon, fall back to 2 × d1.
 
     Returns a Series of through_gap_km indexed as demand_df.
     """
@@ -349,43 +350,110 @@ def compute_corridor_gaps(
 
     # Case 1: candidate is endpoint A, existing charger is endpoint B
     c1 = (edges[edges["b_is_charger"] == 1]
-          [["lon_a", "lat_a", "distance_km"]]
-          .rename(columns={"lon_a": "lon", "lat_a": "lat"}))
+          [["lon_a", "lat_a", "lon_b", "lat_b", "distance_km"]]
+          .rename(columns={
+              "lon_a": "lon", "lat_a": "lat",
+              "lon_b": "charger_lon", "lat_b": "charger_lat",
+          }))
 
     # Case 2: existing charger is endpoint A, candidate is endpoint B
     c2 = (edges[edges["a_is_charger"] == 1]
-          [["lon_b", "lat_b", "distance_km"]]
-          .rename(columns={"lon_b": "lon", "lat_b": "lat"}))
+          [["lon_b", "lat_b", "lon_a", "lat_a", "distance_km"]]
+          .rename(columns={
+              "lon_b": "lon", "lat_b": "lat",
+              "lon_a": "charger_lon", "lat_a": "charger_lat",
+          }))
 
     all_to_ec = pd.concat([c1, c2], ignore_index=True)
-    all_to_ec["lon"] = all_to_ec["lon"].round(6)
-    all_to_ec["lat"] = all_to_ec["lat"].round(6)
+    for col in ["lon", "lat", "charger_lon", "charger_lat"]:
+        all_to_ec[col] = all_to_ec[col].round(6)
 
-    # Minimum road distance from each node to any existing charger
-    min_dist = (all_to_ec
-                .groupby(["lon", "lat"])["distance_km"]
-                .min()
-                .rename("d_nearest_charger_km"))
+    # Keep only the closest path from a candidate to each distinct charger.
+    all_to_ec = (all_to_ec
+                 .sort_values(["lon", "lat", "distance_km"])
+                 .drop_duplicates(subset=["lon", "lat", "charger_lon", "charger_lat"]))
+    all_to_ec["rank"] = all_to_ec.groupby(["lon", "lat"]).cumcount()
+
+    nearest_two = (all_to_ec[all_to_ec["rank"] < 2]
+                   .pivot(index=["lon", "lat"], columns="rank", values="distance_km"))
+    d1_lookup = nearest_two.get(0, pd.Series(dtype=float))
+    d2_lookup = nearest_two.get(1, pd.Series(dtype=float))
 
     # Join back to demand_df
     demand_df = demand_df.copy()
     demand_df["_lon"] = demand_df["lon"].round(6)
     demand_df["_lat"] = demand_df["lat"].round(6)
 
-    d_nearest = (demand_df
-                 .set_index(["_lon", "_lat"])
-                 .index
-                 .map(min_dist.to_dict()))
-    d_nearest = pd.Series(d_nearest, index=demand_df.index).fillna(250.0)
-    d_nearest = d_nearest.clip(upper=250.0)
+    idx = demand_df.set_index(["_lon", "_lat"]).index
+    d1 = pd.Series(idx.map(d1_lookup.to_dict()), index=demand_df.index).fillna(250.0)
+    d2 = pd.Series(idx.map(d2_lookup.to_dict()), index=demand_df.index)
+    d1 = d1.clip(upper=250.0)
+    d2 = d2.clip(upper=250.0)
 
-    # Through-gap = 2 × d_nearest (symmetric approximation)
-    through_gap = (2 * d_nearest).clip(upper=250.0)
+    # If only one charger is reachable, revert to the old symmetric fallback.
+    through_gap = (d1 + d2.fillna(d1)).clip(upper=250.0)
 
-    n_missing = (d_nearest >= 250.0).sum()
+    n_single = d2.isna().sum()
+    n_missing = (d1 >= 250.0).sum()
     print(f"  Through-gap: median={through_gap.median():.1f} km  "
           f"min={through_gap.min():.1f}  max={through_gap.max():.1f}  "
-          f"capped-at-250: {n_missing:,}")
+          f"single-sided fallback: {n_single:,}  capped-at-250: {n_missing:,}")
+    return through_gap
+
+
+# ── 6a-ex. Corridor gap for existing chargers ────────────────────────────────
+
+def compute_corridor_gaps_existing(
+    existing_df: pd.DataFrame,
+    edges_path:  str = cfg.EDGES_250_CSV,
+) -> pd.Series:
+    """
+    For each existing charger, compute through_gap_km using the same d1+d2
+    method as compute_corridor_gaps() for candidates.
+
+    Uses edges_250.csv rows where BOTH endpoints are existing chargers
+    (a_is_charger=1 AND b_is_charger=1) — these are pre-computed road-network
+    Dijkstra distances, so no Euclidean approximation is needed.
+
+    Returns a Series of through_gap_km aligned to existing_df.
+    """
+    print("  Computing corridor gaps for existing chargers from edges_250 …")
+    edges = pd.read_csv(edges_path,
+                        usecols=["lon_a", "lat_a", "lon_b", "lat_b",
+                                 "a_is_charger", "b_is_charger", "distance_km"])
+
+    ec = edges[(edges["a_is_charger"] == 1) & (edges["b_is_charger"] == 1)].copy()
+
+    # Build bidirectional: each charger appears as both "source" and "target"
+    fwd = ec[["lon_a", "lat_a", "lon_b", "lat_b", "distance_km"]].rename(
+              columns={"lon_a": "lon", "lat_a": "lat",
+                       "lon_b": "other_lon", "lat_b": "other_lat"})
+    bwd = ec[["lon_b", "lat_b", "lon_a", "lat_a", "distance_km"]].rename(
+              columns={"lon_b": "lon", "lat_b": "lat",
+                       "lon_a": "other_lon", "lat_a": "other_lat"})
+    both = pd.concat([fwd, bwd], ignore_index=True)
+    for col in ["lon", "lat", "other_lon", "other_lat"]:
+        both[col] = both[col].round(6)
+
+    both = (both.sort_values(["lon", "lat", "distance_km"])
+                .drop_duplicates(subset=["lon", "lat", "other_lon", "other_lat"]))
+    both["rank"] = both.groupby(["lon", "lat"]).cumcount()
+
+    nearest_two = (both[both["rank"] < 2]
+                   .pivot(index=["lon", "lat"], columns="rank", values="distance_km"))
+    d1_lookup = nearest_two.get(0, pd.Series(dtype=float))
+    d2_lookup = nearest_two.get(1, pd.Series(dtype=float))
+
+    ex = existing_df.copy()
+    ex["_lon"] = ex["lon"].round(6)
+    ex["_lat"] = ex["lat"].round(6)
+    idx = ex.set_index(["_lon", "_lat"]).index
+    d1 = pd.Series(idx.map(d1_lookup.to_dict()), index=ex.index).fillna(250.0).clip(upper=250.0)
+    d2 = pd.Series(idx.map(d2_lookup.to_dict()), index=ex.index).clip(upper=250.0)
+
+    through_gap = (d1 + d2.fillna(d1)).clip(upper=250.0)
+    print(f"  Through-gap (existing): median={through_gap.median():.1f} km  "
+          f"min={through_gap.min():.1f}  max={through_gap.max():.1f}")
     return through_gap
 
 
@@ -522,6 +590,7 @@ def build_existing_demand(
     ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
     stop_rate:        float = cfg.STOP_RATE,
+    variable_sr:      bool  = False,
 ) -> pd.DataFrame:
     """
     Compute λ_k for every existing charger station, paired with its actual
@@ -555,14 +624,20 @@ def build_existing_demand(
     assigned = assign_aadt_from_flow(existing_gdf, flow_csv, edges_path)
     result = pd.DataFrame(assigned.drop(columns=["geometry"]))
 
-    result["stop_rate"] = stop_rate
     pen = ev_penetration
+    if variable_sr:
+        through_gap = compute_corridor_gaps_existing(result)
+        result["through_gap_km"] = through_gap.values
+        result["stop_rate"] = compute_variable_stop_rates(through_gap).values
+    else:
+        result["stop_rate"] = stop_rate
+
     result["lambda_k"] = (
-        result["aadt_assigned"] * pen * peak_hour_factor * stop_rate
+        result["aadt_assigned"] * pen * peak_hour_factor * result["stop_rate"]
     ).clip(lower=0.0)
 
     keep = ["lat", "lon", "n_chargers", "mean_power_kw",
-            "aadt_assigned", "highway_class", "lambda_k"]
+            "aadt_assigned", "highway_class", "through_gap_km", "stop_rate", "lambda_k"]
     result = result[[c for c in keep if c in result.columns]]
 
     out = cfg.OUTPUTS_DIR / "existing_demand.csv"

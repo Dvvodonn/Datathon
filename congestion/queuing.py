@@ -70,8 +70,7 @@ def erlang_c(a: float, c: int) -> float:
     rho = a / c  # per-server utilisation
 
     # Numerically stable computation using log-factorials avoids overflow
-    # for large c values (c up to C_MAX=10 is fine with direct floats, but
-    # log-space is safe for future extension to larger C_MAX).
+    # for larger c values; log-space keeps the function safe as C_MAX grows.
     log_a = math.log(a)
 
     # Σ_{k=0}^{c-1} a^k / k!

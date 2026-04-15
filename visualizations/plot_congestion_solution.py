@@ -27,19 +27,31 @@ import geopandas as gpd
 parser = argparse.ArgumentParser()
 parser.add_argument("--tag", type=str, default="",
                     help="Result file tag, e.g. 'v2' reads results_congestion_v2.csv")
+parser.add_argument("--results", type=str, default="",
+                    help="Explicit path to results CSV (overrides --tag)")
+parser.add_argument("--out", type=str, default="",
+                    help="Explicit output PNG path (overrides default)")
 args = parser.parse_args()
 
 tag_str      = f"_{args.tag}" if args.tag else ""
-RESULTS_PATH = f"congestion/outputs/results_congestion{tag_str}.csv"
+RESULTS_PATH = args.results if args.results else f"congestion/outputs/results_congestion{tag_str}.csv"
 NODES_PATH   = "data_main/nodes.csv"
 ROADS_GPKG   = "data/raw/road_network/spain_interurban_edges.gpkg"
-OUT_PNG      = f"visualizations/congestion_solution{tag_str}.png"
+OUT_PNG      = args.out if args.out else f"visualizations/congestion_solution{tag_str}.png"
 
 XLIM = (-9.5, 4.5)
 YLIM = (35.8, 44.0)
 
-# Charger-count colour palette
-C_COLORS = {1: "#ffe066", 2: "#ff9900", 3: "#e63030", 4: "#9b0000"}
+# Charger-count colour palette (extended to c=7)
+C_COLORS = {
+    1: "#ffe066",
+    2: "#ff9900",
+    3: "#e63030",
+    4: "#9b0000",
+    5: "#cc44ff",
+    6: "#7700cc",
+    7: "#ffffff",
+}
 
 print("Loading data …")
 results  = pd.read_csv(RESULTS_PATH)
@@ -103,8 +115,8 @@ for c_val in sorted(built["c_built"].unique()):
         label=f"{int(c_val)} charger{'s' if c_val > 1 else ''}"
     )
 
-# W_q halo rings on built stations (radius ∝ log W_q, skip penalty=480)
-normal_built = built[built["wq_minutes"] < 400]
+# W_q halo rings on built stations (radius ∝ log W_q, skip penalty=45)
+normal_built = built[built["wq_minutes"] < 45]
 for _, row in normal_built.iterrows():
     wq_norm = np.clip(np.log1p(row["wq_minutes"]) / np.log1p(100), 0, 1)
     ring_size = 120 + 200 * wq_norm
@@ -114,31 +126,32 @@ for _, row in normal_built.iterrows():
         edgecolors="white", linewidths=0.8, alpha=0.35, zorder=4
     )
 
-# Saturated station marker (W_q = 480 penalty)
-saturated = built[built["wq_minutes"] >= 400]
+# Saturated station marker (W_q = 45 penalty)
+saturated = built[built["wq_minutes"] >= 45]
 if len(saturated):
     ax.scatter(
         saturated["lon"], saturated["lat"],
         s=180, color="#ff00ff", alpha=0.9, zorder=6,
         edgecolors="white", linewidths=1.0, marker="X",
-        label=f"Saturated (W_q=480 min)"
+        label=f"Saturated (W_q=45 min)"
     )
 
 # ── Stats annotation ──────────────────────────────────────────────────────────
 charger_dist = dict(built["c_built"].value_counts().sort_index())
 dist_str = "  ".join(f"c={k}: {v}" for k, v in charger_dist.items())
-normal_wq = built[built["wq_minutes"] < 400]["wq_minutes"]
+normal_wq = built[built["wq_minutes"] < 45]["wq_minutes"]
 
+gamma_val = float(built["gamma"].iloc[0]) if "gamma" in built.columns else 0.1
 ax.text(
     0.01, 0.99,
     f"Congestion-Extended Benders Solution\n"
-    f"  α = 100 min/charger   β = 1.0\n"
+    f"  γ = {gamma_val}  β = 1.0  φ = 0\n"
     f"  Stations built : {len(built)}\n"
     f"  Chargers total : {int(built['c_built'].sum())}\n"
+    f"  Total kW       : {int((built['c_built']*built['p_built_kw']).sum()):,}\n"
     f"  {dist_str}\n"
     f"  Mean W_q (stable): {normal_wq.mean():.1f} min\n"
-    f"  Saturated stations: {len(saturated)}\n"
-    f"  Convergence gap : 0.02%  (4 iters)",
+    f"  Saturated stations: {len(saturated)}",
     transform=ax.transAxes,
     color="white", fontsize=10, va="top", fontfamily="monospace",
     bbox=dict(facecolor="#111111", alpha=0.85,
@@ -156,8 +169,8 @@ ax.legend(
 )
 
 ax.set_title(
-    "Spain EV Fast-Charging Network — Congestion-Optimal Solution  "
-    "(28 stations, 58 chargers)",
+    f"Spain EV Fast-Charging Network — Congestion-Optimal Solution  "
+    f"({len(built)} stations, {int(built['c_built'].sum())} chargers, γ={gamma_val})",
     color="white", fontsize=14, fontweight="bold", pad=12
 )
 

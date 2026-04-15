@@ -63,6 +63,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 from demand import build_demand
 from queuing import precompute_wq_table
+from corridor_gaps import load_corridor_geometries, compute_corridor_gaps
 
 
 # ── Node key (mirrors model_1.py exactly) ────────────────────────────────────
@@ -160,7 +161,7 @@ def _solve_source(src):
 def build_master_congestion(
     feas_list, city_pairs, cuts, w_total_lookup,
     beta, gamma, fixed_cost, c_min, c_max, power_tiers, lambda_lookup,
-    phi=0.0, coverable_gaps=None, coverable_gaps_2hop=None,
+    phi=0.0, corridor_gap_data=None,
     master_time_limit_ms=300_000,
 ):
     """
@@ -219,17 +220,30 @@ def build_master_congestion(
     # penalty). Forcing c_max ensures max capacity at the most congested sites.
     # For all other locations, no constraint: optimizer picks c freely.
     n_forced = 0
+    n_overdemand = 0
     for i, k in enumerate(feas_list):
         klon, klat = float(k[0]), float(k[1])
         lam_k = lambda_lookup.get((klon, klat), 0.0)
         for j_p, p in enumerate(power_tiers):
             mu_p = p / cfg.E_SESSION_KWH
-            if c_max * mu_p <= lam_k:   # ρ ≥ 1 even at c_max — force c=c_max
-                for j_c, c in enumerate(range(c_min, c_max)):
+            # Find the minimum charger count that achieves ρ < 1
+            c_min_stable = next(
+                (c for c in range(c_min, c_max + 1) if c * mu_p > lam_k), None
+            )
+            if c_min_stable is None:
+                # Permanently overloaded (ρ ≥ 1 even at c_max): force c = c_max
+                # so we deploy maximum capacity and pay the congestion penalty.
+                for j_c in range(c_max - c_min):   # zero out c_min..c_max-1
+                    w[i][j_c][j_p].SetUb(0.0)
+                    n_overdemand += 1
+            else:
+                # Stability is achievable: zero out all unstable options (c < c_min_stable)
+                for j_c, c in enumerate(range(c_min, c_min_stable)):
                     w[i][j_c][j_p].SetUb(0.0)
                     n_forced += 1
-    if n_forced:
-        print(f"  Overdemand: forced {n_forced:,} w-vars to 0 (ρ ≥ 1 at c_max → fix c=c_max)")
+    if n_forced or n_overdemand:
+        print(f"  Stability: zeroed {n_forced:,} under-staffed w-vars; "
+              f"{n_overdemand:,} permanently-overloaded w-vars → c=c_max forced")
 
     # ── Linking: Σ_{c,p} w[i][j_c][j_p] == x[i] ──────────────────────────────
     for i in range(n):
@@ -283,57 +297,44 @@ def build_master_congestion(
             for k in nodes:
                 ct.SetCoefficient(x[feas_idx[tuple(k)]], delta)
 
-    # ── phi corridor-coverage constraint ─────────────────────────────────────
-    # 1-hop gaps (100–200 km): a single station k covers gap (u,v) iff
-    #   dist(u,k) ≤ 100 AND dist(k,v) ≤ 100
-    # 2-hop gaps (200–250 km): a pair (K1,K2) covers gap (u,v) iff
-    #   dist(u,K1) ≤ 100 AND dist(K1,K2) ≤ 100 AND dist(K2,v) ≤ 100
+    # ── phi corridor-coverage constraints (per-corridor) ─────────────────────
+    # corridor_gap_data: {corridor_name: [[feas_idx, ...], ...]}
+    #   Each inner list = candidate indices that can cover that gap.
     #
-    # phi=0 → no constraint
-    # phi=1 → every coverable gap (1-hop + 2-hop) must be covered
-    if phi > 0.0 and (coverable_gaps or coverable_gaps_2hop):
-        n_1hop      = len(coverable_gaps or [])
-        n_2hop      = len(coverable_gaps_2hop or [])
-        min_covered = math.ceil(phi * (n_1hop + n_2hop))
+    # For each corridor c, independently enforce:
+    #   Σ_{g in c} z_c_g  ≥  ceil(phi × |gaps_c|)
+    #
+    # This guarantees phi-fraction progress on EVERY corridor, not just the
+    # globally cheapest phi fraction across all corridors combined.
+    #
+    # phi=0 → no constraints added
+    # phi=1 → all coverable gaps on all 9 corridors must be covered
+    if phi > 0.0 and corridor_gap_data:
+        total_z = 0
+        for c_name, gap_list in corridor_gap_data.items():
+            n_gaps    = len(gap_list)
+            min_cov   = math.ceil(phi * n_gaps)
+            if min_cov == 0:
+                continue
 
-        # ── 1-hop z variables ────────────────────────────────────────────────
-        z1 = [solver.BoolVar(f"z1_{g}") for g in range(n_1hop)]
-        for g, covering_indices in enumerate(coverable_gaps or []):
-            ct = solver.Constraint(-solver.infinity(), 0.0)
-            ct.SetCoefficient(z1[g], 1.0)
-            for idx in covering_indices:
-                ct.SetCoefficient(x[idx], -1.0)
+            z_vars = [solver.BoolVar(f"z_{c_name}_{g}") for g in range(n_gaps)]
+            total_z += n_gaps
 
-        # ── 2-hop relay variables (continuous) ──────────────────────────────
-        # For each 2-hop gap g and each K1 that can relay it, introduce
-        # r[g][k1] ∈ [0,1] (CONTINUOUS — bounded by binary x's, so integer
-        # at any feasible solution; avoids 24k extra branch-on variables):
-        #   r[g][k1] ≤ x[k1]                          (K1 must be open)
-        #   r[g][k1] ≤ Σ_{k2 ∈ valid_K2s} x[k2]      (at least one K2 open)
-        # At any integer solution: r = min(x[K1], Σ x[K2]) ∈ {0,1}. Correct.
-        z2 = [solver.BoolVar(f"z2_{g}") for g in range(n_2hop)]
-        for g, relay_groups in enumerate(coverable_gaps_2hop or []):
-            # relay_groups: dict {k1_idx: [k2_idx, ...]}
-            ct_z = solver.Constraint(-solver.infinity(), 0.0)
-            ct_z.SetCoefficient(z2[g], 1.0)
-            for k1_idx, k2_indices in relay_groups.items():
-                r = solver.NumVar(0.0, 1.0, f"r_{g}_{k1_idx}")  # continuous
-                # r ≤ x[K1]
-                ct1 = solver.Constraint(-solver.infinity(), 0.0)
-                ct1.SetCoefficient(r, 1.0)
-                ct1.SetCoefficient(x[k1_idx], -1.0)
-                # r ≤ Σ x[K2]
-                ct2 = solver.Constraint(-solver.infinity(), 0.0)
-                ct2.SetCoefficient(r, 1.0)
-                for k2_idx in k2_indices:
-                    ct2.SetCoefficient(x[k2_idx], -1.0)
-                # z2[g] ≤ Σ r[g][k1]
-                ct_z.SetCoefficient(r, -1.0)
+            # z[g] ≤ Σ_{k in covering} x[k]   (z is 1 only if some covering station opens)
+            for g, covering_indices in enumerate(gap_list):
+                ct = solver.Constraint(-solver.infinity(), 0.0)
+                ct.SetCoefficient(z_vars[g], 1.0)
+                for idx in covering_indices:
+                    ct.SetCoefficient(x[idx], -1.0)
 
-        # ── Unified global coverage: Σ z1 + Σ z2 ≥ min_covered ─────────────
-        ct = solver.Constraint(float(min_covered), solver.infinity())
-        for zv in z1 + z2:
-            ct.SetCoefficient(zv, 1.0)
+            # Per-corridor coverage floor
+            ct_cov = solver.Constraint(float(min_cov), solver.infinity())
+            for zv in z_vars:
+                ct_cov.SetCoefficient(zv, 1.0)
+
+        if total_z:
+            print(f"  Corridor coverage: {total_z} z-vars across "
+                  f"{len(corridor_gap_data)} corridors (phi={phi})")
 
     return solver, x, w, eta, feas_idx
 
@@ -369,6 +370,7 @@ def main(
     variable_sr:  bool  = True,
     phi:          float = cfg.PHI,
     outputs_dir:  Path  = None,
+    master_time_limit_ms: int = None,
 ):
     """
     Run the congestion-extended Benders decomposition with joint (c, p) decisions.
@@ -538,126 +540,51 @@ def main(
           f"{len(city_pairs):,} city pairs  |  "
           f"{len(cuts):,} warm-start cuts")
 
-    # ── phi corridor-coverage: pre-compute bridgeable city-pair gaps ─────────
-    # 1-hop gaps (100–200 km): single station k covers (u,v) iff
-    #   dist(u,k) ≤ 100 AND dist(k,v) ≤ 100
-    # 2-hop gaps (200–250 km): pair (K1,K2) covers (u,v) iff
-    #   dist(u,K1) ≤ 100 AND dist(K1,K2) ≤ 100 AND dist(K2,v) ≤ 100
-    # Only gaps with at least one covering station/pair are kept.
-    coverable_gaps = []
-    coverable_gaps_2hop = []
+    # ── phi corridor-coverage: pre-compute per-corridor gaps ─────────────────
+    # Uses corridor_gaps.py to:
+    #   1. Load the 9 Iberdrola corridor geometries (A-1…A-6, Mediterranean,
+    #      Cantabrian, Silver) from the OSM GPKG clipped to Spain.
+    #   2. Assign nearby stop nodes (cities + existing chargers) and feasible
+    #      candidates to each corridor by spatial proximity.
+    #   3. Find consecutive stop pairs with road-network distance > 100 km.
+    #   4. For each coverable gap, record which candidate indices can fill it.
+    # Existing chargers are naturally included, so already-bridged gaps are
+    # never added to the gap list.
+    corridor_gap_data = {}
+    synthetic_sites   = []   # [(key_tuple, corridor_name, label), ...]
     if phi > 0.0:
-        print("  Pre-computing bridgeable city-pair gaps for phi constraint …")
-        feas_idx_map = {k: i for i, k in enumerate(feas_list)}
-        _edges = edges_df.copy()
-        _edges["_ka"] = list(zip(_edges["lon_a"].round(6), _edges["lat_a"].round(6)))
-        _edges["_kb"] = list(zip(_edges["lon_b"].round(6), _edges["lat_b"].round(6)))
+        corridor_geoms = load_corridor_geometries(cfg.EDGES_GPKG)
+        corridor_gap_data, synthetic_sites = compute_corridor_gaps(
+            nodes_df=nodes_df,
+            edges_df=edges_df,
+            feas_list=feas_list,
+            corridor_geoms=corridor_geoms,
+            buffer_km=cfg.PHI_CORRIDOR_BUFFER_KM,
+            gap_km=cfg.PHI_MAX_GAP_KM,
+            min_existing_kw=cfg.PHI_MIN_EXISTING_KW,
+        )
 
-        # long city-to-city edges (100 < dist ≤ 200 km)
-        city_long = _edges[
-            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(city_keys) &
-            (_edges["distance_km"] > cfg.PHI_MAX_GAP_KM) &
-            (_edges["distance_km"] <= 2 * cfg.PHI_MAX_GAP_KM)
-        ][["_ka", "_kb", "distance_km"]].copy()
+        # ── Inject synthetic midpoint sites into the optimisation ─────────────
+        # Each synthetic site is placed exactly on the corridor geometry.
+        # It has zero demand (lambda=0) so it costs only the grid penalty when
+        # opened. The optimizer opens it only when phi forces corridor coverage.
+        if synthetic_sites:
+            for syn_key, syn_corridor, syn_label in synthetic_sites:
+                feas_list.append(syn_key)
+                lon_s, lat_s = float(syn_key[0]), float(syn_key[1])
+                lambda_lookup[(lon_s, lat_s)] = 0.0
+                for c in range(c_min, c_max + 1):
+                    for p in (power_tiers or cfg.POWER_TIERS):
+                        session_min = 60.0 * cfg.E_SESSION_KWH / p
+                        # No demand → no queue wait; driver just pays session time
+                        w_total_lookup[(lon_s, lat_s, c, p)] = session_min
+                        wq_lookup[(lon_s, lat_s, c, p)]      = 0.0
+            print(f"  Injected {len(synthetic_sites)} synthetic midpoint site(s) "
+                  f"into feas_list (now {len(feas_list):,} total)")
 
-        # build city → nearby chargers (≤ 100 km)
-        city_to_charger = {}
-        for _, r in _edges[
-            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(charger_keys) &
-            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
-        ].iterrows():
-            city_to_charger.setdefault(r["_ka"], set()).add(r["_kb"])
-        for _, r in _edges[
-            _edges["_ka"].isin(charger_keys) & _edges["_kb"].isin(city_keys) &
-            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
-        ].iterrows():
-            city_to_charger.setdefault(r["_kb"], set()).add(r["_ka"])
-
-        # build city → nearby feasible candidates (≤ 100 km)
-        city_to_feas = {}
-        feas_set_keys = set(feas_list)
-        for _, r in _edges[
-            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(feas_set_keys) &
-            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
-        ].iterrows():
-            city_to_feas.setdefault(r["_ka"], set()).add(r["_kb"])
-        for _, r in _edges[
-            _edges["_ka"].isin(feas_set_keys) & _edges["_kb"].isin(city_keys) &
-            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
-        ].iterrows():
-            city_to_feas.setdefault(r["_kb"], set()).add(r["_ka"])
-
-        seen_pairs = set()
-        for _, r in city_long.iterrows():
-            u, v = r["_ka"], r["_kb"]
-            if (v, u) in seen_pairs:
-                continue
-            seen_pairs.add((u, v))
-            # skip if already bridged by existing charger
-            if city_to_charger.get(u, set()) & city_to_charger.get(v, set()):
-                continue
-            # covering candidate stations
-            covering_keys = city_to_feas.get(u, set()) & city_to_feas.get(v, set())
-            if not covering_keys:
-                continue
-            covering_indices = [feas_idx_map[k] for k in covering_keys if k in feas_idx_map]
-            if covering_indices:
-                coverable_gaps.append(covering_indices)
-
-        print(f"  phi={phi}  1-hop bridgeable gaps (100-200km): {len(coverable_gaps)}"
-              f"  (threshold={cfg.PHI_MAX_GAP_KM} km)")
-
-        # ── 2-hop gaps (200–250 km) ───────────────────────────────────────────
-        # Build feas→feas adjacency within 100 km using vectorised groupby
-        # (reuses _edges already loaded; no extra CSV read needed)
-        feas_keys_set = set(feas_idx_map.keys())
-        _ff = _edges[
-            _edges["_ka"].isin(feas_keys_set) & _edges["_kb"].isin(feas_keys_set) &
-            (_edges["distance_km"] <= cfg.PHI_MAX_GAP_KM)
-        ][["_ka", "_kb"]]
-        feas_to_feas = _ff.groupby("_ka")["_kb"].apply(set).to_dict()
-        for ka, kb_set in _ff.groupby("_kb")["_ka"].apply(set).items():
-            feas_to_feas[ka] = feas_to_feas.get(ka, set()) | kb_set
-
-        city_very_long = _edges[
-            _edges["_ka"].isin(city_keys) & _edges["_kb"].isin(city_keys) &
-            (_edges["distance_km"] > 2 * cfg.PHI_MAX_GAP_KM)
-        ][["_ka", "_kb"]].copy()
-
-        # Cap relay K1s per gap: keep up to MAX_RELAY_K1 with most K2 options.
-        # K1s with more K2 options give the optimizer more flexibility.
-        MAX_RELAY_K1 = 20
-
-        seen_2hop = set()
-        for _, row in city_very_long.iterrows():
-            u, v = row["_ka"], row["_kb"]
-            if (v, u) in seen_2hop:
-                continue
-            seen_2hop.add((u, v))
-            feas_near_u = city_to_feas.get(u, set())
-            feas_near_v = city_to_feas.get(v, set())
-            relay_groups = {}
-            for k1_key in feas_near_u:
-                k1_idx = feas_idx_map.get(k1_key)
-                if k1_idx is None:
-                    continue
-                k2_indices = [
-                    feas_idx_map[k2_key]
-                    for k2_key in feas_to_feas.get(k1_key, set()) & feas_near_v
-                    if k2_key in feas_idx_map
-                ]
-                if k2_indices:
-                    relay_groups[k1_idx] = k2_indices
-            if relay_groups:
-                # Keep K1s with the most K2 options (most routing flexibility)
-                trimmed = dict(
-                    sorted(relay_groups.items(), key=lambda kv: -len(kv[1]))[:MAX_RELAY_K1]
-                )
-                coverable_gaps_2hop.append(trimmed)
-
-        print(f"  phi={phi}  2-hop bridgeable gaps (200-250km): {len(coverable_gaps_2hop)}"
-              f"  of {len(seen_2hop)} total very-long gaps"
-              f"  (relay K1 cap={MAX_RELAY_K1})")
+        total_coverable = sum(len(v) for v in corridor_gap_data.values())
+        print(f"  phi={phi}  corridor gaps to cover: {total_coverable} total "
+              f"across {len(corridor_gap_data)} corridor(s)")
 
     full_nodes = city_set | charger_keys | set(feas_list)
     adj_dict   = dict(adj)
@@ -669,6 +596,9 @@ def main(
     best_x = {k: 0 for k in feas_list}
     best_w = [[[0 for _ in range(n_p)] for _ in range(n_c)]
               for _ in range(len(feas_list))]
+    best_incumbent = None   # (x_vals, w_vals) from best UB iteration
+    ub_stagnant_iters = 0   # iterations since UB last improved
+    UB_STAGNATION_CAP = 5  # stop if UB unchanged for this many iterations
 
     n_w_vars = len(feas_list) * n_c * n_p
     print(f"\nStarting Benders loop ({cfg.MAX_ITER} max iters, {n_workers} workers) …")
@@ -679,11 +609,14 @@ def main(
         t0 = timer.time()
 
         # ── Solve master ──────────────────────────────────────────────────────
-        master_tl = 900_000 if phi > 0.0 else 300_000  # 15 min for phi>0, 5 min otherwise
+        if master_time_limit_ms is not None:
+            master_tl = master_time_limit_ms
+        else:
+            master_tl = 1_500_000 if phi > 0.0 else 300_000  # 25 min for phi>0, 5 min otherwise
         solver, x, w, eta, feas_idx = build_master_congestion(
             feas_list, city_pairs, cuts, w_total_lookup,
             beta, gamma, fixed_cost, c_min, c_max, power_tiers, lambda_lookup,
-            phi=phi, coverable_gaps=coverable_gaps, coverable_gaps_2hop=coverable_gaps_2hop,
+            phi=phi, corridor_gap_data=corridor_gap_data,
             master_time_limit_ms=master_tl,
         )
         status = solver.Solve()
@@ -793,6 +726,13 @@ def main(
             best_w = [[[w_vals[i][j_c][j_p] for j_p in range(n_p)]
                        for j_c in range(n_c)]
                       for i in range(len(feas_list))]
+            best_incumbent = (dict(x_vals),
+                              [[[w_vals[i][j_c][j_p] for j_p in range(n_p)]
+                                for j_c in range(n_c)]
+                               for i in range(len(feas_list))])
+            ub_stagnant_iters = 0
+        else:
+            ub_stagnant_iters += 1
 
         gap = (upper_bound - lower_bound) / max(upper_bound, 1e-9) * 100
         proven_str = "OPT" if master_proven else "feas"
@@ -806,6 +746,10 @@ def main(
             break
         if cuts_added == 0:
             print(f"\nNo new cuts — search exhausted at iteration {iteration}.")
+            break
+        if ub_stagnant_iters >= UB_STAGNATION_CAP:
+            print(f"\nUB stagnant for {UB_STAGNATION_CAP} iterations — "
+                  f"stopping early with best solution found.")
             break
 
     # ── Save cuts ─────────────────────────────────────────────────────────────
@@ -865,6 +809,37 @@ def main(
     nodes_result["fixed_cost"] = fixed_cost
 
     nodes_result = nodes_result.drop(columns=["key"])
+
+    # ── Append synthetic midpoint rows if any were opened ────────────────────
+    if synthetic_sites:
+        synth_rows = []
+        for syn_key, syn_corridor, syn_label in synthetic_sites:
+            if best_x.get(syn_key, 0) > 0.5:
+                c_s = c_built_map.get(syn_key, 0)
+                p_s = p_built_map.get(syn_key, 0)
+                synth_rows.append({
+                    "lat":                 float(syn_key[1]),
+                    "lon":                 float(syn_key[0]),
+                    "name":                syn_label,
+                    "is_city":             0,
+                    "is_feasible_location":1,
+                    "is_existing_charger": 0,
+                    "n_chargers":          0,
+                    "mean_power_kw":       0.0,
+                    "x_built":             1,
+                    "c_built":             c_s,
+                    "p_built_kw":          p_s,
+                    "wq_minutes":          0.0,
+                    "lambda_k":            0.0,
+                    "gamma":               gamma,
+                    "fixed_cost":          fixed_cost,
+                })
+        if synth_rows:
+            nodes_result = pd.concat(
+                [nodes_result, pd.DataFrame(synth_rows)], ignore_index=True
+            )
+            print(f"  Added {len(synth_rows)} synthetic site row(s) to results.")
+
     results_out = out_dir / f"results_congestion{tag_str}.csv"
     nodes_result.to_csv(results_out, index=False)
     print(f"Results saved → {results_out}")

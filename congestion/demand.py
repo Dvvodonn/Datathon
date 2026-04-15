@@ -327,8 +327,10 @@ def add_usage_crosscheck(
 # ── 6a. Corridor-aware through-gap computation ────────────────────────────────
 
 def compute_corridor_gaps(
-    demand_df:  pd.DataFrame,
-    edges_path: str = cfg.EDGES_250_CSV,
+    demand_df:      pd.DataFrame,
+    edges_path:     str   = cfg.EDGES_250_CSV,
+    nodes_path:     str   = cfg.NODES_CSV,
+    min_charger_kw: float = 50.0,
 ) -> pd.Series:
     """
     For each candidate k, compute the through-gap G_k (km) — the total road
@@ -341,12 +343,34 @@ def compute_corridor_gaps(
     shortest distances to distinct existing chargers. If only one charger is
     reachable within the 250 km graph horizon, fall back to 2 × d1.
 
+    min_charger_kw : only existing chargers >= this power level are counted as
+                     competitors that suppress demand at a new station.
+                     22 kW AC chargers are excluded (3+ hour charge time);
+                     50 kW is the practical minimum for highway fast-charging.
+
     Returns a Series of through_gap_km indexed as demand_df.
     """
-    print("  Computing corridor gaps from edges_250 …")
+    # Build set of qualifying charger coordinate keys
+    _nodes = pd.read_csv(nodes_path,
+                         usecols=["lat", "lon", "is_existing_charger", "mean_power_kw"])
+    hq_mask = (_nodes["is_existing_charger"] == 1) & (_nodes["mean_power_kw"] >= min_charger_kw)
+    hq_keys = set(
+        _nodes.loc[hq_mask, "lon"].round(6).astype(str)
+        + "_"
+        + _nodes.loc[hq_mask, "lat"].round(6).astype(str)
+    )
+    print(f"  Computing corridor gaps from edges_250 "
+          f"(≥{min_charger_kw:.0f} kW chargers only: {len(hq_keys)}) …")
+
     edges = pd.read_csv(edges_path,
                         usecols=["lon_a", "lat_a", "lon_b", "lat_b",
                                  "a_is_charger", "b_is_charger", "distance_km"])
+
+    # Override charger flags: only count chargers >= min_charger_kw
+    a_key = edges["lon_a"].round(6).astype(str) + "_" + edges["lat_a"].round(6).astype(str)
+    b_key = edges["lon_b"].round(6).astype(str) + "_" + edges["lat_b"].round(6).astype(str)
+    edges["a_is_charger"] = edges["a_is_charger"].astype(bool) & a_key.isin(hq_keys)
+    edges["b_is_charger"] = edges["b_is_charger"].astype(bool) & b_key.isin(hq_keys)
 
     # Case 1: candidate is endpoint A, existing charger is endpoint B
     c1 = (edges[edges["b_is_charger"] == 1]
@@ -404,8 +428,10 @@ def compute_corridor_gaps(
 # ── 6a-ex. Corridor gap for existing chargers ────────────────────────────────
 
 def compute_corridor_gaps_existing(
-    existing_df: pd.DataFrame,
-    edges_path:  str = cfg.EDGES_250_CSV,
+    existing_df:    pd.DataFrame,
+    edges_path:     str   = cfg.EDGES_250_CSV,
+    nodes_path:     str   = cfg.NODES_CSV,
+    min_charger_kw: float = 50.0,
 ) -> pd.Series:
     """
     For each existing charger, compute through_gap_km using the same d1+d2
@@ -415,12 +441,31 @@ def compute_corridor_gaps_existing(
     (a_is_charger=1 AND b_is_charger=1) — these are pre-computed road-network
     Dijkstra distances, so no Euclidean approximation is needed.
 
+    min_charger_kw : only chargers >= this power level count as corridor stops.
+
     Returns a Series of through_gap_km aligned to existing_df.
     """
-    print("  Computing corridor gaps for existing chargers from edges_250 …")
+    # Build set of qualifying charger coordinate keys
+    _nodes = pd.read_csv(nodes_path,
+                         usecols=["lat", "lon", "is_existing_charger", "mean_power_kw"])
+    hq_mask = (_nodes["is_existing_charger"] == 1) & (_nodes["mean_power_kw"] >= min_charger_kw)
+    hq_keys = set(
+        _nodes.loc[hq_mask, "lon"].round(6).astype(str)
+        + "_"
+        + _nodes.loc[hq_mask, "lat"].round(6).astype(str)
+    )
+    print(f"  Computing corridor gaps for existing chargers from edges_250 "
+          f"(≥{min_charger_kw:.0f} kW only: {len(hq_keys)}) …")
+
     edges = pd.read_csv(edges_path,
                         usecols=["lon_a", "lat_a", "lon_b", "lat_b",
                                  "a_is_charger", "b_is_charger", "distance_km"])
+
+    # Override charger flags: only count chargers >= min_charger_kw
+    a_key = edges["lon_a"].round(6).astype(str) + "_" + edges["lat_a"].round(6).astype(str)
+    b_key = edges["lon_b"].round(6).astype(str) + "_" + edges["lat_b"].round(6).astype(str)
+    edges["a_is_charger"] = edges["a_is_charger"].astype(bool) & a_key.isin(hq_keys)
+    edges["b_is_charger"] = edges["b_is_charger"].astype(bool) & b_key.isin(hq_keys)
 
     ec = edges[(edges["a_is_charger"] == 1) & (edges["b_is_charger"] == 1)].copy()
 
@@ -560,7 +605,7 @@ def build_demand(
     result = add_usage_crosscheck(result, cuts_path)
 
     if variable_sr:
-        through_gap = compute_corridor_gaps(result, edges_250_path)
+        through_gap = compute_corridor_gaps(result, edges_250_path, nodes_path, min_charger_kw=50.0)
         stop_rates  = compute_variable_stop_rates(through_gap)
         result["through_gap_km"] = through_gap.values
         result = compute_lambda(result, ev_penetration, peak_hour_factor, stop_rates.values)
@@ -587,6 +632,7 @@ def build_existing_demand(
     nodes_path:       str   = cfg.NODES_CSV,
     flow_csv:         str   = cfg.ROAD_FLOW_CSV,
     edges_path:       str   = cfg.EDGES_GPKG,
+    edges_250_path:   str   = cfg.EDGES_250_CSV,
     ev_penetration:   float = cfg.EV_PENETRATION,
     peak_hour_factor: float = cfg.PEAK_HOUR_FACTOR,
     stop_rate:        float = cfg.STOP_RATE,
@@ -626,7 +672,7 @@ def build_existing_demand(
 
     pen = ev_penetration
     if variable_sr:
-        through_gap = compute_corridor_gaps_existing(result)
+        through_gap = compute_corridor_gaps_existing(result, edges_250_path, nodes_path, min_charger_kw=50.0)
         result["through_gap_km"] = through_gap.values
         result["stop_rate"] = compute_variable_stop_rates(through_gap).values
     else:

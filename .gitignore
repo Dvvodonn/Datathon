@@ -51,3 +51,10 @@ models/results_nodes.csv
 
 # Large raw geometries (over GitHub 100 MB limit)
 spain_interurban_edges.gpkg
+
+# Precomputed Benders cut files (large JSON artifacts — regenerate via model.py)
+congestion/outputs/congestion_cuts*.json
+
+# Large sweep output directory (4.9 GB — share via OneDrive)
+datathon_master/
+models/routes_250_alpha45_roads.geojson

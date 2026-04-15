@@ -33,12 +33,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 
 # ── Constants (module-level so worker subprocesses can import safely) ─────────
-GAMMA_VALUES = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.70,
-                1.00, 1.50, 2.00, 3.00, 5.00, 7.00, 10.0]
+# Denser sampling in the defensible range γ ∈ [0.10, 0.40]; thinner outside.
+GAMMA_VALUES = [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25,
+                0.30, 0.35, 0.40, 0.50, 0.70, 1.00]
 
-CUTS_PATH  = str(cfg.OUTPUTS_DIR / "congestion_cuts.json")
-OUTPUT_CSV = cfg.OUTPUTS_DIR / "gamma_frontier.csv"
-OUTPUT_PNG = Path("visualizations/gamma_frontier.png")
+# Warm-start from densest available cut set (245k cuts, γ-independent)
+CUTS_PATH  = str(cfg.OUTPUTS_DIR / "congestion_cuts_g10_0.json")
+OUTPUT_CSV = cfg.OUTPUTS_DIR / "gamma_frontier_v2.csv"
+OUTPUT_PNG = Path("visualizations/gamma_frontier_v2.png")
 
 
 def _run_sweep():
@@ -52,7 +54,7 @@ def _run_sweep():
     records = []
 
     for gamma in GAMMA_VALUES:
-        tag = f"g{str(gamma).replace('.', '_')}"
+        tag = f"v2_g{str(gamma).replace('.', '_')}"
         print(f"\n{'='*60}")
         print(f"  γ = {gamma}  (tag={tag})")
         print(f"{'='*60}")
@@ -65,6 +67,7 @@ def _run_sweep():
                 c_max=cfg.C_MAX,
                 cuts_in_path=CUTS_PATH,
                 tag=tag,
+                variable_sr=True,
             )
 
             built = results_df[results_df["x_built"] == 1]

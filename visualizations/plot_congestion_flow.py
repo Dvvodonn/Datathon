@@ -9,11 +9,12 @@ with roads coloured by calibrated AADT flow (road_edges_flow.csv).
   Existing chargers  : blue dots
   Built stations     : coloured by power tier  (50=yellow  150=orange  350=red)
                        size ∝ charger count c_built
-  Saturated station  : magenta X   (W_q = 480 min penalty)
+  Saturated station  : magenta X   (W_q = 45 min penalty)
 
 Output: visualizations/solution_map_congestion_flow.png
 """
 
+import argparse
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as mcm
@@ -23,10 +24,15 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 
-RESULTS_PATH = "congestion/outputs/results_congestion.csv"
+parser = argparse.ArgumentParser()
+parser.add_argument("--input",  type=str, default="congestion/outputs/results_congestion.csv")
+parser.add_argument("--output", type=str, default="visualizations/solution_map_congestion_flow.png")
+args = parser.parse_args()
+
+RESULTS_PATH = args.input
 NODES_PATH   = "data_main/nodes.csv"
 ROADS_GPKG   = "data/raw/road_network/spain_interurban_edges.gpkg"
-OUT_PNG      = "visualizations/solution_map_congestion_flow.png"
+OUT_PNG      = args.output
 
 XLIM = (-9.5, 4.5)
 YLIM = (35.8, 44.0)
@@ -61,8 +67,8 @@ unselected = feasible[
         lambda r: (round(r["lon"], 6), round(r["lat"], 6)) in built_coords, axis=1
     )
 ]
-saturated    = built[built["wq_minutes"] >= 400]
-normal_built = built[built["wq_minutes"] < 400]
+saturated    = built[built["wq_minutes"] >= 45]
+normal_built = built[built["wq_minutes"] < 45]
 
 print(f"  Built: {len(built)}  |  Unselected: {len(unselected):,}  |  "
       f"Existing: {len(existing):,}")
@@ -132,7 +138,7 @@ if len(saturated):
     ax.scatter(saturated["lon"], saturated["lat"],
                c="#ff00ff", s=120, alpha=1.0, zorder=6,
                linewidths=0.8, edgecolors="white", marker="X",
-               label=f"Saturated (W_q=480 min, {len(saturated)})")
+               label=f"Saturated (W_q=45 min, {len(saturated)})")
 
 # ── Colorbar ──────────────────────────────────────────────────────────────────
 sm = mcm.ScalarMappable(cmap=cmap, norm=norm)

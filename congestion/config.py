@@ -10,7 +10,7 @@ rather than editing this file.
 from pathlib import Path
 
 # ── EV demand ─────────────────────────────────────────────────────────────────
-EV_PENETRATION   = 0.07    # fraction of highway traffic assumed to be EV
+EV_PENETRATION   = 0.025   # fraction of highway traffic assumed to be EV
                             # if the input AADT data contains a per-segment
                             # column named 'ev_penetration', that overrides this
 PEAK_HOUR_FACTOR = 0.13    # share of daily AADT that falls in the single
@@ -63,10 +63,15 @@ FIXED_COST       = 0.0     # station opening cost F·x_k (minutes equivalent)
                             # captures site-prep / civil-work cost independent
                             # of charger count and power tier
 
-PHI              = 0.0     # min fraction of opened stations that must have
-                            # through_gap_km ≤ PHI_MAX_GAP_KM
-                            # 0 → unconstrained; 1 → all stations on short gaps
-PHI_MAX_GAP_KM   = 100.0   # gap threshold (km) that defines "short" corridors
+PHI              = 0.0     # fraction of corridor gaps that must be covered
+                            # 0 → unconstrained; 1 → all 9 corridors fully covered
+                            # Applied per-corridor: each corridor must cover
+                            # ceil(phi × its own gap count) independently.
+PHI_MAX_GAP_KM   = 100.0   # consecutive-stop gap threshold (km); Iberdrola target
+PHI_CORRIDOR_BUFFER_KM  = 5.0    # max distance from corridor geometry to assign a node
+PHI_MIN_EXISTING_KW    = 150.0  # only existing chargers ≥ this kW count as gap-covering
+                                 # stops for the corridor constraint; lower-power AC
+                                 # chargers do not satisfy Iberdrola's 150 kW mandate
 
 PENALTY_INFEASIBLE = 5_000 # virtual travel time (min) for disconnected pairs
 N_CITIES         = 235     # city clusters — must match models/model_1.py

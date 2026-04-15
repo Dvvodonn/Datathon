@@ -17,9 +17,9 @@ from shapely.geometry import shape
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 GEOJSON = os.path.join(
-    os.path.dirname(__file__), "..", "download_flow_data", "imd_total_por_tramo.geojson"
+    os.path.dirname(__file__), "..", "..", "data", "intermediate", "traffic_flow", "imd_total_por_tramo.geojson"
 )
-OUT_PNG = os.path.join(os.path.dirname(__file__), "spain_road_flow_2022.png")
+OUT_PNG = os.path.join(os.path.dirname(__file__), "..", "..", "outputs", "maps", "spain_road_flow_2022.png")
 
 # ── Spain bounding box in EPSG:3857 (Web Mercator) ───────────────────────────
 SPAIN = dict(xmin=-1_100_000, xmax=420_000, ymin=4_200_000, ymax=5_500_000)
@@ -41,8 +41,12 @@ def load_segments(path):
         if aadt is None or geom is None:
             continue
         # Project each path from WGS84 lon/lat → Web Mercator (EPSG:3857)
-        for path in geom["coordinates"]:
-            xy = [_wgs84_to_3857(lon, lat) for lon, lat in path]
+        coords = geom["coordinates"]
+        # LineString: list of points; MultiLineString or paths: list of lists
+        if coords and not isinstance(coords[0][0], (list, tuple)):
+            coords = [coords]  # wrap single LineString
+        for path in coords:
+            xy = [_wgs84_to_3857(pt[0], pt[1]) for pt in path]  # handles 2D and 3D points
             if len(xy) >= 2:
                 segments.append((xy, aadt))
 
